@@ -5,7 +5,7 @@ use crate::logging::get_default_log4rs_config;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use types::RTPStreamState;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 use prost::{bytes::BytesMut, Message};
@@ -19,6 +19,8 @@ use p::callsig;
 use p::mediacontrol;
 use tokio_util::sync::CancellationToken;
 use crate::types::{PeerState, ChannelState, CallState, ServerState};
+
+const server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50051));
 
 fn generate_err_message (
     message_id: u32,
@@ -88,8 +90,14 @@ fn generate_connect (message_id: u32) -> Vec<u8> {
 }
 
 fn generate_olc_ack (message_id: u32, fwcn: u32, port_number: u16) -> Vec<u8> {
+    let ip = mediacontrol::IpAddress { version: Some(mediacontrol::ip_address::Version::V4([ 127, 0, 0, 1 ].into())) };
     let params = mediacontrol::H2250LogicalChannelAckParameters{
         port_number: Some(port_number.into()),
+        media_channel: Some(mediacontrol::TransportAddress{
+            variant: Some(mediacontrol::transport_address::Variant::IpAddress(ip)),
+            port: port_number.into(),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let olc_ack = mediacontrol::OpenLogicalChannelAck{
@@ -179,9 +187,10 @@ async fn handle_setup (
 fn handle_rtp_packet <'a> (
     rtp_packet: &'a rtp_rs::RtpReader<'a>,
 ) {
-    if rtp_packet.version() != 2 { // TODO: Handle version 1?
-        return;
-    }
+    // if rtp_packet.version() != 2 { // TODO: Handle version 1?
+    //     return;
+    // }
+    println!("Got RTP packet");
     // TODO: If this is the first RTP packet, record the initial timestamp and sequence number.
     // (since the timestamp can be random)
     // TODO: Record the SSRC. Ignore subsequent packets that differ in this regard.
@@ -202,9 +211,10 @@ async fn receive_rtp_packets (
             }
             val = socket.recv_from(&mut buf) => {
                 let (len, peer_addr) = val.unwrap(); // TODO: Handle
-                if peer_addr != correct_peer_addr {
+                if peer_addr.ip() != correct_peer_addr.ip() {
+                    println!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
                     // TODO: Log or block?
-                    break; // Just ignore packets from naughtybois.
+                    continue; // Just ignore packets from naughtybois.
                 }
                 match rtp_rs::RtpReader::new(&buf[0..len]) {
                     Ok(rtp_packet) => {
@@ -224,7 +234,7 @@ async fn receive_rtp_packets (
 async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, CancellationToken)> {
     // TODO: Pick an unused port
     let port = 9099;
-    let socket_addr = SocketAddr::new([0,0,0,0].into(), port);
+    let socket_addr = SocketAddr::new([127,0,0,1].into(), port);
     let socket = UdpSocket::bind(socket_addr).await?;
     println!("Listening for RTP traffic on {}", socket_addr);
     let token = CancellationToken::new();
@@ -438,7 +448,7 @@ async fn handle_packet (
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use prost::Message;
     log4rs::init_config(get_default_log4rs_config()).unwrap();
-    let local_addr: SocketAddr = "127.0.0.1:50051".parse()?;
+    let local_addr: SocketAddr = server_addr;
     let mut buf = [0; 65536];
     let state = ServerState{
         peers: Arc::new(RwLock::new(HashMap::new())),
