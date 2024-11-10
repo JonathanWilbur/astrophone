@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "astrophone-server",
+    "astrophone-client",
+]

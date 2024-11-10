@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package mtsid;
+
+message MTSIdentifier {
+    bytes uuid = 1;
+}

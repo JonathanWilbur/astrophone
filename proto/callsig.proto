@@ -1,0 +1,804 @@
+syntax = "proto3";
+
+package callsig;
+
+import "google/protobuf/any.proto";
+import "mtsid.proto";
+import "mediacontrol.proto";
+
+/*
+This protocol is a Protocol Buffers / gRPC implementation of H.323 call
+signalling and media control. It differs from these specifications in the
+following respects:
+
+1. All fields pertaining to protocol / version identification have been removed,
+   as this will be a fixed-version protocol.
+2. All fields pertaining to identification of caller and callee have been
+   removed, since the caller and callee are provided as a part of a separate
+   addressing service provided by the underlying transport.
+3. All fields pertaining to the usage of a Gatekeeper or Gateway have been
+   removed. With addressing and routing implicitly provided by the underlying
+   transport, a Gatekeeper would provide little value, and would not work well
+   with secure, encrypted transport.
+4. All fields related to authentication, integrity, or confidentiality of the
+   call signalling or media control data are removed, because these security
+   services are presumed to be provided by the underlying transport. Note that
+   this protocol still provides fields for protecting the real-time media
+   channels, such as pre-shared keys for SRTP.
+5. There is no negotiation of supplementary services. Implementations are
+   required to decode and understand the H.450.x supplementary service APDUs
+   whose analogs are replicated to this protocol, but may reject them.
+
+As it turns out, when you make the above modifications to the protocol, it
+becomes a lot simpler!
+
+// TODO: Finish
+This protocol does handle message numbering, because it cannot be guaranteed
+that the underlying transport uses message numbering that is compatible with
+
+// TODO: Reconsider 
+
+*/
+
+enum CallSignallingErrorCode {
+
+    // See ITU H.450.1 General-Error-List ASN.1 module.
+    CS_ERR_USER_NOT_SUBSCRIBED = 0; // userNotSubscribed
+    CS_ERR_REJECTED_BY_NETWORK = 1; // rejectedByNetwork 
+    CS_ERR_REJECTED_BY_USER = 2; // rejectedByUser
+    CS_ERR_NOT_AVAILABLE = 3; // notAvailable
+    // 4 is skipped...
+    CS_ERR_INSUFFICIENT_INFO = 5; // insufficientInformation
+    CS_ERR_INVALID_SERVED_USER_NUMBER = 6; // invalidServedUserNumber
+    CS_ERR_INVALID_CALL_STATE = 7; // invalidCallState
+    CS_ERR_BASIC_SERVICE_NOT_PROVIDED = 8; // basicServiceNotProvided
+    CS_ERR_NOT_INCOMING_CALL = 9; // notIncomingCall
+    CS_ERR_SS_INTERACTION_NOT_ALLOWED = 10; // supplementaryServiceInteractionNotAllowed
+    CS_ERR_RESOURCE_UNAVAILABLE = 11; // resourceUnavailable
+    CS_ERR_CALL_FAILURE = 25; // callFailure
+    CS_ERR_PROCEDURAL_ERROR = 43; // proceduralError
+
+    // These are defined in ITU H.450.2
+    CS_ERR_INVALID_REROUTING_NUMBER = 1004; // invalidReroutingNumber
+    CS_ERR_UNRECOGNIZED_CALL_IDENTITY = 1005; // unrecognizedCallIdentity
+    CS_ERR_ESTABLISHMENT_FAILURE = 1006; // establishmentFailure
+
+    // These are defined in ITU H.450.3
+    CS_ERR_SPECIAL_SERVICE_NUMBER = 14;
+    CS_ERR_DIVERSION_TO_SERVED_USER_NUMBER = 15;
+    CS_ERR_NUMBER_OF_DIVERSIONS_EXCEEDED = 24;
+    CS_ERR_TEMPORARILY_UNAVAILABLE = 1000;
+    CS_ERR_NOT_AUTHORIZED = 1007;
+    CS_ERR_UNSPECIFIED = 1008;
+
+    // These are defined in ITU H.450.5
+    CS_ERR_CALL_PICKUP_INVALID_ID = 2000;
+    CS_ERR_CALL_ALREADY_PICKED_UP = 2001;
+
+    // These are defined in ITU H.450.9
+    CS_ERR_CC_SHORT_TERM_REJECTION = 1010;
+    CS_ERR_CC_LONG_TERM_REJECTION = 1011;
+    CS_ERR_CC_REMOTE_USER_BUSY_AGAIN = 1012;
+    CS_ERR_CC_FAILURE_TO_MATCH = 1013;
+
+    // These are defined in ITU H.450.11
+    CS_ERR_NOT_BUSY = 1009;
+    // CS_ERR_TEMPORARILY_UNAVAILABLE = 1000; // Duplicated
+    // CS_ERR_NOT_AUTHORIZED = 1007; // Dulicated
+
+    // This is defined in ITU H.450.4.
+    CS_ERR_UNDEFINED = 2002;
+}
+
+message CallSignallingError {
+    uint32 messageId = 1;
+    CallSignallingErrorCode code = 2;
+    string message = 3;
+    repeated google.protobuf.Any details = 4;
+    repeated string stackTrace = 5;
+}
+
+message CallSignalling {
+    uint32 messageId = 1;
+    CallIdentifier callId = 14;
+    oneof body {
+        Setup setup = 2;
+        CallProceeding callProceeding = 3;
+        Connect connect = 4;
+        Alerting alerting = 5;
+        CallInformation information = 6;
+        ReleaseComplete releaseComplete = 7;
+        Progress progress = 8;
+        Status status = 9;
+        StatusInquiry statusInquiry = 10;
+        SetupAcknowledge setupAcknowledge = 11;
+        Notify notify = 12;
+        CallSignallingError error = 13;
+
+        HoldNotificationArg holdNotific = 15;
+        RetrieveNotificationArg retrieveNotific = 16;
+
+        RemoteHoldArg remoteHold = 17;
+        RemoteRetriveArg remoteRetrieveArg = 18;
+        RemoteHoldResult remoteHoldResult = 19;
+        RemoteRetriveResult remoteRetrieveResult = 20;
+        CallTransferInitiateArg callTransferInitiate = 21;
+        CallTransferIdentifyArg callTransferIdentifyArg = 22;
+        CallTransferIdentifyResult callTransferIdentifyResult = 23;
+        CallTransferAbandonArg callTransferAbandon = 24;
+        RemoteUserAlertingArg remoteUserAlerting = 25;
+        CallReroutingArg callRerouting = 26; // Sent from the served user to start any call diversion.
+        CallReroutingResult callReroutingResult = 27;
+
+        // Sent by a served user to a diverted-to endpoint to check in advance whether diversion is acceptable.
+        CheckRestrictionArg checkRestrictionArg = 28;
+
+        // Sent from a diverted-to endpoint to indicate whether diversion is accepted.
+        CheckRestrictionResult checkRestrictionResult = 29;
+
+        CallParkArg cpRequest = 30;
+
+        // These operations deviate a little from H.323 call signalling. In
+        // H.450.5, the invocations may be carried over SETUP and the results
+        // over RELEASE COMPLETE. In my opinion, this is an abuse of the call
+        // signalling system, since no call is actually being set up. For this
+        // reason, this deviation breaks these arguments and results into their own
+        // separate call signalling PDUs here. Other than the above, these messages
+        // may also be carried over FACILITY. This protocol allows these to be sent
+        // outside of a call, before a SETUP (if any) is sent.
+        GroupIndicationOnArg groupIndicationOnArg = 31;
+        GroupIndicationOnResult groupIndicationOnResult = 32;
+        GroupIndicationOffArg groupIndicationOffArg = 33;
+        GroupIndicationOffResult groupIndicationOffResult = 34;
+
+        CallParkNotifyArg cpNotify = 35;
+        CallPickupNotifyArg cpickupNotify = 36;
+
+        PickupArg pickupArg = 37;
+        PickupResult pickupResult = 38;
+        PickRequestArg pickRequestArg = 39; // This is normally sent over SETUP.
+        PickRequestResult pickRequestResult = 40;
+        CcRequestArg ccnrRequestArg = 41;
+        CcRequestArg ccbsRequestArg = 42;
+        CcLongArg ccExecPossible = 43;
+        CcShortArg ccSuspend = 44;
+        CcLongArg ccResume = 45;
+
+        // This normally goes in SETUP or RELEASE COMPLETE. This is a deviation.
+        CcLongArg ccCancel = 46;
+
+        CallIntrusionArg callIntrusionRequestArg = 47;
+        CallIntrusionArg callIntrusionForcedReleaseArg = 48;
+        CallIntrusionArg callIntrusionSilentMonitorArg = 49;
+        CallIntrusionResult callIntrusionRequestResult = 50;
+        CallIntrusionResult callIntrusionForcedReleaseResult = 51;
+        CallIntrusionResult callIntrusionSilentMonitorResult = 52;
+        CIIsOptArg callIntrusionIsolateArg = 53;
+        CIWobOptArg callIntrusionWOBRequestArg = 54;
+        CINotificationArg callIntrusionNotificationArg = 55;
+        CIIsOptRes callIntrusionIsolateResult = 56;
+        CIWobOptRes callIntrusionWOBRequestResult = 57;
+    }
+    // This combines fastStart, and h245Control, and parallelH245Control fields all in one.
+    repeated mediacontrol.MediaControlMessage mediaControl = 60; // H.245 tunneling is ALWAYS supported in this protocol.
+    CallLinkage callLinkage = 61;
+}
+
+message CallLinkage {
+    bytes globalCallId = 1;
+    bytes threadId = 2;
+}
+
+enum ConferenceGoal {
+    CONFERENCE_GOAL_CREATE = 0;
+    CONFERENCE_GOAL_INVITE = 1;
+    CONFERENCE_GOAL_JOIN = 2;
+    CONFERENCE_GOAL_CAP_NEGO = 3;
+    CONFERENCE_GOAL_CALL_IND_SUP_SVC = 4;
+}
+
+message EndpointAddress {
+    oneof variant {
+        bytes opaque = 1;
+        string email = 2;
+        string phone = 3;
+        mtsid.MTSIdentifier mtsid = 4;
+    }
+}
+
+message CallIdentifier {
+    bytes uuid = 1;
+    // Just for human-friendly display
+    string name = 2;
+}
+
+message Setup {
+    bool activeMC = 1;
+    bytes conferenceId = 2; // GUID
+    ConferenceGoal conferenceGoal = 3;
+    bool multipoint = 4; // Corresponds to CallType.nToN. Otherwise, CallType.pointToPoint.
+
+    // CallIdentifier callIdentifier = 5; // GUID (Moved to the top message)
+    // mediaWaitForConnect is implied.
+    repeated string language = 6; // RFC 5646 language tags
+    // symmetricOperationRequired is always ABSENT
+
+    // This is equivalent to the callOfferRequest supplementary service remote operation.
+    // If true, and if the called party is busy, the called party should be
+    // presented with the option of taking this call instead. Otherwise, the
+    // call should just be automatically rejected because it is busy.
+    bool callOfferRequest = 34; // local:34
+
+    // This works with callOfferRequest when the called party has
+    // Call Forwarding Busy active. If true, it says "I don't want to get
+    // diverted if the called party is busy, I need the called party exactly."
+    bool cfbOverride = 49; // local:49
+
+    // This is sent by a transferred caller to the transferred-to endpoint after
+    // being transferred.
+    optional CallTransferSetupArg callTransferSetup = 10;
+
+    // Sent along with the SETUP to a diverted-to endpoint from a user that was just diverted.
+    optional DivertingLegInfo2Arg callDiverted = 11;
+
+    optional CallParkArg cpSetup = 12; // Says "I was sent here to park."
+
+    optional PickExeArg pickExe = 13; // Says "You have chosen to pickup my call from park, so here I am."
+
+    optional CcShortArg ccRingout = 14; // Says "I am calling you, since you have indicated that you are free now."
+
+    optional CallIntrusionArg callIntrusionArg = 15; // Request to intrude on a call.
+
+    // Provides ITU H.450.8 callingName. Implementations should inform users
+    // that this can be spoofed. Implementations may also refuse to display
+    // this or modify it.
+    string callerName = 16;
+
+    // Provides ITU H.450.12 feature information.
+    FeatureInfo featureInfo = 17;
+
+    // This is this protocol's alternative to the Master-Slave Determination
+    // used in H.323. The client sending SETUP can request to be master using
+    // this field. Ultimately, the called party has final say by their choice
+    // of the iAmMaster field on the CONNECT PDU, which takes precedence.
+    // If the iAmMaster field of the CONNECT PDU is set to true, the called
+    // party is the master, regardless of what the calling party requested.
+    bool iAmMaster = 18;
+
+    mediacontrol.TerminalCapabilitySet capabilities = 19;
+}
+
+// 2
+message CallProceeding {
+    // No fields included.
+}
+
+// 3
+message Alerting {
+    optional CallWaitingArg callWaiting = 105;
+    optional CallTransferSetupResult callTransferSetup = 10;
+
+    // Provides ITU H.450.8 alertingName. Implementations should inform users
+    // that this can be spoofed. Implementations may also refuse to display
+    // this or modify it.
+    string calledName = 16;
+}
+
+// 4
+message Connect {
+    optional CallTransferSetupResult callTransferSetup = 10;
+    optional DivertingLegInfo3Arg diversionComplete = 11;
+    optional PickupArg pickupArg = 12;
+    optional PickExeResult pickExe = 13;
+    optional CcRequestRes ccResult = 6; // ccbsRequest or ccnrRequest return result.
+    optional CallIntrusionResult callIntrusionResult = 7;
+    
+    // There is no callIntrusionGetCIPL operation, as defined in ITU H.450.11.
+    // A request for the CIPL is always implied.
+    CIProtectionLevel ciProtectionLevel = 8;
+    bool silentMonitoringPermitted = 9;
+
+    // Provides ITU H.450.8 connectedName. Implementations should inform users
+    // that this can be spoofed. Implementations may also refuse to display
+    // this or modify it.
+    string calledName = 1;
+
+    // Provides ITU H.450.12 feature information.
+    FeatureInfo featureInfo = 17;
+
+    // This is this protocol's alternative to the Master-Slave Determination
+    // used in H.323. The client sending SETUP can request to be master using
+    // this field. Ultimately, the called party has final say by their choice
+    // of the iAmMaster field on the CONNECT PDU, which takes precedence.
+    // If the iAmMaster field of the CONNECT PDU is set to true, the called
+    // party is the master, regardless of what the calling party requested.
+    bool iAmMaster = 18;
+
+    mediacontrol.TerminalCapabilitySet capabilities = 19;
+}
+
+message CallInformation {
+    // No fields included.
+}
+
+enum ReleaseCompleteReason {
+    RELEASE_COMPLETE_NO_BANDWIDTH = 0; // bandwidth taken away or ARQ denied
+    RELEASE_COMPLETE_GATEKEEPER_RESOURCES = 1; // exhausted
+    RELEASE_COMPLETE_UNREACHABLE_DESTINATION = 2; // no transport path to the destination
+    RELEASE_COMPLETE_DESTINATION_REJECTION = 3; // rejected at destination
+    RELEASE_COMPLETE_INVALID_REVISION = 4;
+    RELEASE_COMPLETE_NO_PERMISSON = 5; // called party's gatekeeper rejects
+    RELEASE_COMPLETE_UNREACHABLE_GATEKEEPER = 6; // terminal cannot reach gatekeeper
+    RELEASE_COMPLETE_GATEWAY_RESOURCES = 7;
+    RELEASE_COMPLETE_BAD_FORMAT_ADDRESS = 8;
+    RELEASE_COMPLETE_ADAPTIVE_BUSY = 9; // call is dropping due to LAN crowding
+    RELEASE_COMPLETE_IN_CONF = 10; // called party busy
+    RELEASE_COMPLETE_UNDEFINED_REASON = 11;
+    RELEASE_COMPLETE_FACILITY_CALL_DEFLECTION = 12; // call was deflected using a Facility
+    RELEASE_COMPLETE_SECURITY_DENIED = 13; // incompatible security settings
+    RELEASE_COMPLETE_CALLED_PARTY_NOT_REGISTERED = 14; 
+    RELEASE_COMPLETE_CALLER_NOT_REGISTERED = 15;
+    RELEASE_COMPLETE_NEW_CONNECTION_NEEDED = 16;
+    RELEASE_COMPLETE_REPLACE_WITH_CONFERENCE_INVITE = 17; // (see 8.4.3.8/H.323)
+    RELEASE_COMPLETE_GENERIC_DATA_REASON = 18;
+    RELEASE_COMPLETE_NEEDED_FEATURE_NOT_SUPPORTED = 19;
+    RELEASE_COMPLETE_INVALID_CID = 20;
+    RELEASE_COMPLETE_SECURITY_ERROR = 21;
+    RELEASE_COMPLETE_HOP_COUNT_EXCEEDED = 22;
+}
+
+message ReleaseComplete {
+    ReleaseCompleteReason reason = 1;
+    bytes replaceWithConference = 2; // Comes from the reason field in H.225.0 / replaceWithConferenceInvite
+    optional CallTransferInitiateResult callTransferred = 3; // Equivalent to including callTransferInitiate result if true.
+    optional CallReroutingResult callRerouted = 4;
+    optional CallParkResult cpRequest = 5; // Tells receiver "Okay, I am parked now."
+    optional CcRequestRes ccResult = 6; // ccbsRequest or ccnrRequest return result.
+
+    // Provides ITU H.450.8 busyName. Implementations should inform users
+    // that this can be spoofed. Implementations may also refuse to display
+    // this or modify it.
+    string calledName = 16;
+}
+
+message Progress {
+    CallWaitingArg callWaiting = 105;
+    CallParkResult cpSetup = 106;
+}
+
+message Status {
+    // No fields included.
+}
+
+message StatusInquiry {
+    // No fields included.
+}
+
+message SetupAcknowledge {
+    // No fields included.
+}
+
+message Notify {
+    // No fields included.
+}
+
+// ITU H.450.3 Call Diversion
+
+enum DiversionReason {
+    DIVERSION_REASON_UNKNOWN = 0;
+    DIVERSION_REASON_CFU = 1; // Call Forwarding Unconditional
+    DIVERSION_REASON_CFB = 2; // Call Forwarding when Busy
+    DIVERSION_REASON_CFNR = 3; // Call Forwarding on No Response
+}
+
+enum SubscriptionOption {
+    SUBSCRIPTION_OPTION_NO_NOTIFICATION = 0;
+    SUBSCRIPTION_OPTION_NOTIFICATION_WITHOUT_DIVERTED_TO_NR = 1;
+    SUBSCRIPTION_OPTION_NOTIFICATION_WITH_DIVERTED_TO_NR = 2;
+}
+
+message CallReroutingArg {
+    DiversionReason reroutingReason = 1;
+    optional DiversionReason originalReroutingReason = 2;
+    EndpointAddress calledAddress = 3;
+    uint32 diversionCounter = 4;
+    EndpointAddress lastReroutingNr = 5;
+    SubscriptionOption subscriptionOption = 6;
+    EndpointAddress callingNumber = 7;
+    string callingInfo = 8;
+    optional EndpointAddress originalCalledNr = 9;
+    string redirectingInfo = 10;
+    string originalCalledInfo = 11;
+}
+
+// Can be a separate FACILITY message or sent in RELEASE COMPLETE depending on what diversion type.
+message CallReroutingResult {
+    // intentionally empty
+}
+
+// Goes in calling user's SETUP sent to the diverted-to endpoint
+message DivertingLegInfo2Arg {
+    uint32 diversionCounter = 1;
+    DiversionReason diversionReason = 2;
+    optional DiversionReason originalDiversionReason = 3;
+    optional EndpointAddress divertingNr = 4;
+    optional EndpointAddress originalCalledNr = 5;
+    string redirectingInfo = 6;
+    string originalCalledInfo = 7;
+}
+
+// Goes in forwarded-to user's CONNECT
+message DivertingLegInfo3Arg {
+    bool presentationAllowedIndicator = 1;
+    optional EndpointAddress redirectionNr = 2;
+    string redirectionInfo = 3;
+}
+
+message CheckRestrictionArg {
+    EndpointAddress servedUserNr = 1;
+    EndpointAddress divertedToNr = 2;
+}
+
+message CheckRestrictionResult {
+    optional CallSignallingError error = 1; // If set, the call diversion was rejected.
+}
+
+// ITU H.450.4 Call Holding Operations
+// These are intentionally empty. The operations have no parameters except extensions.
+// The Facility message is NOT used for call holding in this protocol.
+
+message HoldNotificationArg {
+
+}
+
+message RetrieveNotificationArg {
+
+}
+
+message RemoteHoldArg {
+
+}
+
+message RemoteRetriveArg {
+
+}
+
+message RemoteHoldResult {
+    // intentionally empty
+}
+
+message RemoteRetriveResult {
+    // intentionally empty
+}
+
+// ITU H.450.6 Call Waiting Operations
+
+message CallWaitingArg {
+    optional uint32 nbOfAddWaitingCalls = 1;
+}
+
+// ITU H.450.2 Call Transfer
+
+message CallTransferInitiateArg {
+    uint32 callIdentity = 1;
+    EndpointAddress reroutingNumber = 2;
+}
+
+message CallTransferInitiateResult {
+    // intentionally empty
+}
+
+message CallTransferSetupArg {
+    uint32 callIdentity = 1;
+    EndpointAddress transferringNumber = 2;
+}
+
+message CallTransferSetupResult {
+    // intentionally empty
+}
+
+message CallTransferIdentifyArg {
+    uint32 callIdentity = 1;
+    EndpointAddress reroutingNumber = 2;
+}
+
+message CallTransferIdentifyResult {
+    // intentionally empty
+}
+
+message CallTransferAbandonArg {
+
+}
+
+message CallTransferUpdateArg {
+
+}
+
+// callTransferUpdate is not used: not clear how it is used.
+// subaddressTransfer is not used: not clear how it is used, and subaddressing may be obsolete.
+// callTransferComplete is not used: used only with gatekeepers.
+// callTransferActive is not used: used only with gatekeepers.
+
+// ITU H.450.10 Call Offering
+
+// This is normally sent in FACILITY to indicate that the called party just
+// became free (while the calling party is waiting).
+message RemoteUserAlertingArg { // local:115
+
+}
+
+// ITU H.450.5 Call Park
+
+enum ParkCondition {
+    PARK_COND_UNSPECIFIED = 0;
+    PARK_COND_PARKED_TO_USER_IDLE = 1;
+    PARK_COND_PARKED_TO_USER_BUSY = 2;
+    PARK_COND_PARKED_TO_GROUP = 3;
+}
+
+// Sent in FACILITY for cpRequest, but in SETUP when cpSetup
+// Sent by one terminal to put the other in park.
+// cpRequest invoke: Sent by the parking terminal to the parked terminal to say "Please park here: ..."
+// cpSetup invoke: Sent by the parking terminal to parked-to terminal to say "X told me to park here, so here I am!"
+message CallParkArg {
+    EndpointAddress parkingNumber = 1;
+    EndpointAddress parkedNumber = 2;
+    EndpointAddress parkedToNumber = 3;
+    optional uint32 parkedToPosition = 4;
+}
+
+// Sent in RELEASE COMPLETE if cpRequest, but in PROGRESS when cpSetup
+// cpRequest result: Sent by the parked terminal back to the parking terminal to say "Okay, I am parked now."
+// cpSetup result: Sent by the parked-at terminal to the parked terminal to say "Okay, wait here."
+message CallParkResult {
+    // intentionally empty
+    EndpointAddress parkedToNumber = 1;
+    optional uint32 parkedToPosition = 2;
+    ParkCondition parkCondition = 3;
+}
+
+// Used to start local park.
+message CallParkNotifyArg {
+    optional EndpointAddress parkingNumber = 1;
+}
+
+// Used to pickup from local park.
+message CallPickupNotifyArg {
+    optional EndpointAddress pickingUpNumber = 1;
+}
+
+// ITU H.450.5 Call Pickup
+
+// May be sent in FACILITY or SETUP.
+// Sent by the parked-at terminal to the parked terminal to say "Somebody (possibly me) is ready for you now."
+message PickupArg {
+    // callPickupId seems superfluous, since it is set to the call identifier,
+    // but it is included anyway for better integration with H.323.
+    CallIdentifier callPickupId = 1;
+    EndpointAddress pickingUpNumber = 2;
+}
+
+// Only sent in FACILITY.
+// Sent by the parked terminal to the parked-at terminal to say "Okay, I am ready, too."
+message PickupResult {
+    // intentionally empty
+}
+
+// Only sent in SETUP.
+// Sent by the picking-up terminal to the parking terminal to say "Let me handle this call."
+message PickRequestArg {
+    EndpointAddress pickingUpNumber = 1;
+    optional CallIdentifier callPickupId = 2;
+    optional EndpointAddress partyToRetrieve = 3;
+    EndpointAddress retrieveAddress = 4;
+    optional uint32 parkPosition = 5;
+}
+
+// Only sent in FACILITY.
+// Sent by the parking terminal back to the picking-up terminal to say "Okay. I sent the caller over to you."
+message PickRequestResult {
+    // intentionally empty
+    CallIdentifier callPickupId = 1;
+}
+
+// Sent in a SETUP message exclusively.
+// Sent by the original calling terminal to the picking-up terminal to say "I was sent to you from parking."
+message PickExeArg {
+    CallIdentifier callPickupId = 1;
+    EndpointAddress pickingUpNumber = 2;
+    EndpointAddress partyToRetrieve = 3; // Parked or calling user.
+}
+
+// Returned in a CONNECT message exclusively.
+message PickExeResult {
+    // intentionally empty
+}
+
+// ITU H.450.5 Call Park and Pickup Group Notification
+
+// Used to alert other call pickup group members of the call's availability.
+message GroupIndicationOnArg {
+    CallIdentifier callPickupId = 1;
+    EndpointAddress groupMemberUserNr = 2;
+    bool alerting = 3; // Derived from the retrieveCallType field
+    EndpointAddress partyToRetrieve = 4;
+    EndpointAddress retrieveAddress = 5;
+    optional uint32 parkPosition = 6;
+}
+
+message GroupIndicationOnResult {
+    // intentionally empty
+}
+
+// Used to alert other call pickup group members that a call has been picked up / handled.
+message GroupIndicationOffArg {
+    EndpointAddress callPickupId = 1;
+    EndpointAddress groupMemberUserNr = 2;
+}
+
+message GroupIndicationOffResult {
+    // intentionally empty
+}
+
+// ITU H.450.9 Call Completion
+
+// ccbsRequest goes in SETUP
+// ccbsRequest result goes in RELEASE COMPLETE or CONNECT
+// ccExecPossible goes in SETUP or FACILITY, but IMO, it should only be in FACILITY.
+// ccRingout goes in SETUP
+// ccSuspend and ccResume go in FACILITY
+// ccCancel sounds like this could be in SETUP or RELEASE COMPLETE
+
+enum BasicService {
+    BASIC_SERVICE_ALL = 0;
+    BASIC_SERVICE_AUDIO = 1;
+    BASIC_SERVICE_VIDEO = 2;
+}
+
+message CcRequestArg {
+    EndpointAddress numberA = 1;
+    EndpointAddress numberB = 2;
+    optional CallIdentifier ccIdentifier = 3;
+    BasicService service = 4;
+    bool canRetainService = 5;
+    optional bool retainSigConnection = 6;
+}
+
+message CcRequestRes {
+    // intentionally empty
+    bool retainService = 1;
+}
+
+message CcShortArg {
+    optional CallIdentifier cIdentifier = 1;
+}
+
+message CcLongArg {
+    optional CallIdentifier cIdentifier = 1;
+    optional EndpointAddress numberA = 2;
+    optional EndpointAddress numberB = 3;
+    BasicService service = 4;
+}
+
+// ITU H.450.11 Call Intrusion
+
+enum CICapabilityLevel {
+    CI_CAP_NONE = 0; // Not present in the H.450.11 CICapabilityLevel, but Protocol Buffers requires a 0.
+    CI_CAP_LOW = 1;
+    CI_CAP_MED = 2;
+    CI_CAP_HIGH = 3;
+}
+
+enum CIProtectionLevel {
+    CI_PROT_LOW = 0;
+    CI_PROT_MED = 1;
+    CI_PROT_HIGH = 2;
+    CI_PROT_FULL = 3;
+}
+
+enum CIStatusInformation {
+    CI_STATUS_IMPENDING = 0;
+    CI_STATUS_INTRUDED = 1;
+    CI_STATUS_ISOLATED = 2;
+    CI_STATUS_FORCE_RELEASED = 3;
+    CI_STATUS_COMPLETE = 4;
+    CI_STATUS_END = 5;
+}
+
+enum CallIntrusionType {
+    CI_TYPE_NORMAL = 0;
+    CI_TYPE_FORCED_RELEASE = 1;
+    CI_TYPE_SILENT_MONITOR = 2;
+}
+
+// callIntrusionRequest // Sent in SETUP for "normal intrusion" or FACILITY
+// callIntrusionForcedRelease // Sent in SETUP or FACILITY
+// callIntrusionSilentMonitor // Sent in SETUP
+// callIntrusionGetCIPL // Sent in FACILITY
+// callIntrusionIsolate // Sent in FACILITY
+// callIntrusionWOBRequest // Sent in FACILITY
+// callIntrusionNotification // Sent in FACILITY
+
+// Used for callIntrusionRequest, callIntrusionForcedRelease, and callIntrusionSilentMonitor
+message CallIntrusionArg {
+    CICapabilityLevel ciCapabilityLevel = 1;
+    CallIdentifier specificCall = 2; // Only used for callIntrusionSilentMonitor
+    CallIntrusionType type = 3;
+}
+
+message CallIntrusionResult {
+    // intentionally empty
+    CIStatusInformation ciStatusInformation = 1;
+}
+
+// There is no callIntrusionGetCIPL operation in this protocol. It is always implied.
+// message CIGetCIPLOptArg {}
+
+message CIGetCIPLRes {
+    // intentionally empty
+    CIProtectionLevel ciProtectionLevel = 1;
+    bool silentMonitoringPermitted = 2;
+}
+
+message CIIsOptArg {
+
+}
+
+message CIIsOptRes {
+    // intentionally empty
+}
+
+message CIWobOptArg {
+
+}
+
+message CIWobOptRes {
+    // intentionally empty
+}
+
+message CINotificationArg {
+    CIStatusInformation ciStatusInformation = 1;
+}
+
+// ITU H.450.12 Common Information
+
+enum PartyCategory {
+    PARTY_CATEGORY_UNKNOWN = 0;
+    PARTY_CATEGORY_EXTENSION = 1;
+    PARTY_CATEGORY_ATTENDANT = 2;
+    PARTY_CATEGORY_EMERG_EXT = 3;
+}
+
+message FeatureInfo {
+    optional FeatureList featureList = 1;
+    optional FeatureValues featureValues = 2;
+    FeatureControl FeatureControl = 3;
+}
+
+message FeatureList {
+    bool ssCFreRoutingSupported = 1;
+    bool ssCTreRoutingSupported = 2;
+    bool ssCCBSPossible = 3;
+    bool ssCCNRPossible = 4;
+    bool ssCOSupported = 5;
+    bool ssCIForcedReleaseSupported = 6;
+    bool ssCIIsolationSupported = 7;
+    bool ssCIWaitOnBusySupported = 8;
+    bool ssCISilentMonitoringSupported = 9;
+    bool ssCIConferenceSupported = 10;
+    bool ssCHFarHoldSupported = 11;
+    bool ssMWICallbackSupported = 12;
+    bool ssCPCallParkSupported = 13;
+}
+
+message FeatureValues {
+    PartyCategory partyCategory = 1;
+    optional CIProtectionLevel ssCIprotectionLevel = 2;
+}
+
+message FeatureControl {
+    bool ssCHDoNotHold = 1;
+    bool ssCTDoNotTransfer = 2;
+    bool ssMWICallbackCall = 3;
+    bool ssCISilentMonitorPermitted = 4;
+}
