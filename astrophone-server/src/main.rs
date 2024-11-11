@@ -2,23 +2,33 @@ mod p;
 mod logging;
 mod types;
 use crate::logging::get_default_log4rs_config;
+use ringbuf::SharedRb;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use types::RTPStreamState;
 use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
-use std::sync::atomic::AtomicU32;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use prost::{bytes::BytesMut, Message};
 use anyhow;
 use std::collections::HashMap;
 use uuid::Uuid;
 use tokio::sync::{Mutex, mpsc};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use tokio::io::AsyncReadExt;
 use p::callsig;
 use p::mediacontrol;
 use tokio_util::sync::CancellationToken;
 use crate::types::{PeerState, ChannelState, CallState, ServerState};
+use audio_codec_algorithms::decode_alaw;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{SampleFormat, SampleRate};
+use ringbuf::{
+    traits::{Consumer, Producer, Split},
+    HeapRb,
+    CachingProd,
+};
+use ringbuf::storage::Heap;
 
 const server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50051));
 
@@ -184,24 +194,28 @@ async fn handle_setup (
     Ok(())
 }
 
+
 fn handle_rtp_packet <'a> (
     rtp_packet: &'a rtp_rs::RtpReader<'a>,
 ) {
     // if rtp_packet.version() != 2 { // TODO: Handle version 1?
     //     return;
     // }
-    println!("Got RTP packet");
     // TODO: If this is the first RTP packet, record the initial timestamp and sequence number.
     // (since the timestamp can be random)
     // TODO: Record the SSRC. Ignore subsequent packets that differ in this regard.
     // TODO: If the RTP packet is due to be played now, play it now, otherwise, schedule it in the future.
+
+    // For now, just assume the payload is G.711A. I'll make it nice later.
+    // rtp_packet.payload()
 }
 
 async fn receive_rtp_packets (
     correct_peer_addr: SocketAddr,
     socket: UdpSocket,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
+    mut producer: CachingProd<Arc<SharedRb<Heap<u8>>>>,
+) {
     let mut buf = [0; 65536];
 
     loop {
@@ -219,7 +233,8 @@ async fn receive_rtp_packets (
                 match rtp_rs::RtpReader::new(&buf[0..len]) {
                     Ok(rtp_packet) => {
                         // TODO: Check the stream number and such from the packet.
-                        handle_rtp_packet(&rtp_packet);
+                        // handle_rtp_packet(&rtp_packet);
+                        producer.push_slice(rtp_packet.payload());
                     },
                     Err(e) => {
                         println!("Error decoding RTP packet: {:?}", e); // TODO: Handle this some other way.
@@ -228,7 +243,6 @@ async fn receive_rtp_packets (
             }
         }
     };
-    Ok(())
 }
 
 async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, CancellationToken)> {
@@ -238,7 +252,63 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, Cancella
     let socket = UdpSocket::bind(socket_addr).await?;
     println!("Listening for RTP traffic on {}", socket_addr);
     let token = CancellationToken::new();
-    tokio::spawn(receive_rtp_packets(peer_addr, socket, token.clone()));
+
+    let ring = HeapRb::<u8>::new(1200);
+    let (mut producer, mut consumer) = ring.split();
+
+    let host = cpal::default_host();
+    let device = host.default_output_device().expect("No output audio device found");
+    let mut supported_configs = device.supported_output_configs()
+        .expect("error while querying configs");
+    let config = supported_configs
+        .find(|c| c.channels() == 1 && c.sample_format() == SampleFormat::I16);
+    let config = config.unwrap().with_sample_rate(SampleRate(8000)).into();
+    tokio::spawn(receive_rtp_packets(peer_addr, socket, token.clone(), producer));
+
+    /* If this approach seems abstruse, let me assure you I did not want to do
+    it this way. See: https://github.com/RustAudio/cpal/issues/818 */
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag2 = Arc::clone(&flag);
+    let thread2 = std::thread::spawn(move || {
+        let stream = device.build_output_stream(
+            &config,
+            move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                let mut input_fell_behind = false;
+                for sample in data {
+                    *sample = match consumer.try_pop() {
+                        Some(s) => decode_alaw(s),
+                        None => {
+                            input_fell_behind = true;
+                            i16::MAX - 10000
+                        }
+                    };
+                }
+                if input_fell_behind {
+                    eprintln!("input stream fell behind: try increasing latency");
+                }
+            },
+            move |err| {
+                println!("Audio output error: {}", err);
+            },
+            Some(Duration::from_millis(30)) // None=blocking, Some(Duration)=timeout
+        ).expect("Could not build output stream");
+        stream.play().expect("Could not start audio output");
+        while !flag2.load(Ordering::Relaxed) {
+            std::thread::park();
+        }
+    });
+
+    // This next section is basically:
+    // "Stop the audio output if the RTP stream is closed."
+    let token2 = token.clone();
+    tokio::spawn(async move {
+        token2.cancelled().await; // Wait until cancellation
+        flag.store(true, Ordering::Relaxed); // Set a flag to true (atomically)
+        // Finally, unblock the audio streaming thread, so the `stream` value
+        // can drop and thereby stop outputting audio.
+        thread2.thread().unpark();
+    });
+
     Ok((port, token))
 }
 
