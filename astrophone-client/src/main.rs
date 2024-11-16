@@ -20,6 +20,7 @@ const server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1
 
 const RTP_PAYLOAD_TYPE_G711_A: u8 = 8;
 
+// TODO: Also send SDES packet to RTCP endpoint
 fn send_rtp (to: SocketAddr) {
     let host = cpal::default_host();
     let socket = NetUdpSocket::bind("0.0.0.0:0").expect("Could not bind");
@@ -86,7 +87,27 @@ fn handle_packet (cs: callsig::CallSignalling) -> u32 {
             mediacontrol::media_control_message::Variant::OpenLogicalChannelAck(olc_ack) => {
                 let fwdlc_ack = olc_ack.h2250_logical_channel_ack_parameters.as_ref().unwrap();
                 let fwd_chan = fwdlc_ack.media_channel.as_ref().unwrap();
+                // TODO: Replace with decoding code.
                 match fwd_chan.variant.as_ref().unwrap() {
+                    mediacontrol::transport_address::Variant::IpAddress(ip) => {
+                        match ip.version.as_ref().unwrap() {
+                            mediacontrol::ip_address::Version::V4(v4) => {
+                                let ipv4 = Ipv4Addr::new(v4[0], v4[1], v4[2], v4[3]);
+                                let ip = IpAddr::V4(ipv4);
+                                let socket_addr = SocketAddr::new(server_addr.ip(), fwd_chan.port as u16);
+                                send_rtp(socket_addr);
+                            },
+                            mediacontrol::ip_address::Version::V6(v6) => {
+                                unimplemented!()
+                            }
+                        }
+                    },
+                    _ => {
+                        unimplemented!()
+                    }
+                }
+                let fwd_chan_ctl = fwdlc_ack.media_control_channel.as_ref().unwrap();
+                match fwd_chan_ctl.variant.as_ref().unwrap() {
                     mediacontrol::transport_address::Variant::IpAddress(ip) => {
                         match ip.version.as_ref().unwrap() {
                             mediacontrol::ip_address::Version::V4(v4) => {

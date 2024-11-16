@@ -1,11 +1,14 @@
 mod p;
 mod logging;
+mod rtcp;
 mod types;
 use crate::logging::get_default_log4rs_config;
 use ringbuf::SharedRb;
+use rtcp::{RTCPHeader, SenderReportHeader};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use types::RTPStreamState;
+use core::str;
 use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +17,7 @@ use anyhow;
 use std::collections::HashMap;
 use uuid::Uuid;
 use tokio::sync::{Mutex, mpsc};
-use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use p::callsig;
 use p::mediacontrol;
@@ -29,6 +32,22 @@ use ringbuf::{
     CachingProd,
 };
 use ringbuf::storage::Heap;
+use std::mem::size_of;
+use rtcp::{
+    RTCP_PT_SR,
+    RTCP_PT_RR,
+    RTCP_PT_SDES,
+    RTCP_PT_BYE,
+    RTCP_PT_APP,
+    RTCP_SDES_CNAME,
+    RTCP_SDES_NAME,
+    RTCP_SDES_EMAIL,
+    RTCP_SDES_PHONE,
+    RTCP_SDES_LOC,
+    RTCP_SDES_TOOL,
+    RTCP_SDES_NOTICE,
+    RTCP_SDES_PRIV,
+};
 
 const server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50051));
 
@@ -99,20 +118,30 @@ fn generate_connect (message_id: u32) -> Vec<u8> {
     cs.encode_to_vec()
 }
 
-fn generate_olc_ack (message_id: u32, fwcn: u32, port_number: u16) -> Vec<u8> {
+fn generate_olc_ack (message_id: u32, fwcn: u32, rtp_port: u16, rtcp_port: u16) -> Vec<u8> {
     let ip = mediacontrol::IpAddress { version: Some(mediacontrol::ip_address::Version::V4([ 127, 0, 0, 1 ].into())) };
     let params = mediacontrol::H2250LogicalChannelAckParameters{
-        port_number: Some(port_number.into()),
+        port_number: Some(rtp_port.into()),
         media_channel: Some(mediacontrol::TransportAddress{
+            variant: Some(mediacontrol::transport_address::Variant::IpAddress(ip.to_owned())),
+            port: rtp_port.into(),
+            ..Default::default()
+        }),
+        media_control_channel: Some(mediacontrol::TransportAddress{
             variant: Some(mediacontrol::transport_address::Variant::IpAddress(ip)),
-            port: port_number.into(),
+            port: rtcp_port.into(),
             ..Default::default()
         }),
         ..Default::default()
     };
+    // let reverse = mediacontrol::ReverseLogicalChannelParameters{
+    //     logical_channel_number: 1, // Does this have to be unique among the FW channel numbers? Assign these in a better way
+    //     ..Default::default()
+    // };
     let olc_ack = mediacontrol::OpenLogicalChannelAck{
         forward_logical_channel_number: fwcn,
         h2250_logical_channel_ack_parameters: Some(params),
+        reverse: None,
         ..Default::default()
     };
     let m = mediacontrol::MediaControlMessage{
@@ -213,24 +242,25 @@ fn handle_rtp_packet <'a> (
 async fn receive_rtp_packets (
     correct_peer_addr: SocketAddr,
     socket: UdpSocket,
+    rtcp_socket: UdpSocket,
     cancel: CancellationToken,
     mut producer: CachingProd<Arc<SharedRb<Heap<u8>>>>,
 ) {
-    let mut buf = [0; 65536];
+    let mut rtcp_buf = [0; 65536];
+    let mut rtp_buf = [0; 65536];
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
             }
-            val = socket.recv_from(&mut buf) => {
+            val = socket.recv_from(&mut rtp_buf) => {
                 let (len, peer_addr) = val.unwrap(); // TODO: Handle
                 if peer_addr.ip() != correct_peer_addr.ip() {
                     println!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
-                    // TODO: Log or block?
                     continue; // Just ignore packets from naughtybois.
                 }
-                match rtp_rs::RtpReader::new(&buf[0..len]) {
+                match rtp_rs::RtpReader::new(&rtp_buf[0..len]) {
                     Ok(rtp_packet) => {
                         // TODO: Check the stream number and such from the packet.
                         // handle_rtp_packet(&rtp_packet);
@@ -240,17 +270,192 @@ async fn receive_rtp_packets (
                         println!("Error decoding RTP packet: {:?}", e); // TODO: Handle this some other way.
                     },
                 };
+            },
+            val = rtcp_socket.recv_from(&mut rtcp_buf) => {
+                let (len, peer_addr) = val.unwrap(); // TODO: Handle
+                if peer_addr.ip() != correct_peer_addr.ip() {
+                    println!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
+                    continue; // Just ignore packets from naughtybois.
+                }
+                if len < 8 {
+                    if !(len == 4 && rtcp_buf[1] == RTCP_PT_BYE) {
+                        log::debug!("Empty BYE RTCP packet received from {}", peer_addr);
+                        continue;
+                    }
+                    log::warn!("Invalid RTCP packet from {}", peer_addr);
+                    continue;
+                }
+                if rtcp_buf[0] & 0b1100_0000 != 0b1000_0000 {
+                    log::warn!("Unsupported RTCP packet version from peer {}", peer_addr);
+                    continue;
+                }
+                // TODO: Check version
+                // This should be aligned, since it is 8 bytes and starts at the
+                // beginning of the stack frame.
+                let rtcp_header: RTCPHeader = bytemuck::pod_read_unaligned(&rtcp_buf[0..size_of::<RTCPHeader>()]);
+                
+                log::debug!("Received RTCP packet type {} of length {} for SSRC {:#010X} from peer {}",
+                    rtcp_header.packet_type,
+                    rtcp_header.length,
+                    rtcp_header.ssrc,
+                    peer_addr);
+                // TODO: Move parsing logic to separate functions for testability.
+                match rtcp_header.packet_type {
+                    RTCP_PT_SR => { // Sender Report https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1
+                        // let sender_report_header: SenderReportHeader = bytemuck::pod_read_unaligned(
+                        //     &rtcp_buf[8..8+size_of::<SenderReportHeader>()]);
+                        // TODO: Use
+                    },
+                    RTCP_PT_RR => { // Receiver Report https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.2
+                        // TODO: Use
+                    },
+                    RTCP_PT_SDES => { // Source Description https://datatracker.ietf.org/doc/html/rfc3550#section-6.5
+                        let reported_count = rtcp_buf[0] & 0b0001_1111;
+                        let mut actual_count = 1;
+                        let mut ssrc: Option<u32> = Some(rtcp_header.ssrc);
+                        let mut s = &rtcp_buf[8..];
+                        while s.len() > 0 {
+                            if s[0] == 0 {
+                                ssrc = None;
+                                continue;
+                            }
+                            if ssrc.is_none() {
+                                if s.len() < 4 {
+                                    log::warn!("Malformed (short) SSRC in SDES RTCP packet from peer {}", peer_addr);
+                                    break;
+                                }
+                                ssrc = Some(u32::from_be_bytes([ s[0], s[1], s[2], s[3] ]));
+                                actual_count += 1;
+                                s = &s[4..];
+                                continue;
+                            }
+                            let sdes_type = s[0];
+                            s = &s[1..];
+                            if s.len() == 0 {
+                                log::warn!("Malformed (short) SSRC in SDES RTCP packet from peer {}", peer_addr);
+                                break;
+                            }
+                            let sdes_len = s[0] as usize;
+                            s = &s[1..];
+                            if s.len() < sdes_len {
+                                log::warn!("Malformed (short) SSRC in SDES RTCP packet from peer {}", peer_addr);
+                                break;
+                            }
+                            let sdes = &s[0..sdes_len];
+                            let sdes_name = match sdes_type {
+                                // all ascii / utf8 except PRIV
+                                RTCP_SDES_CNAME => "CNAME",
+                                RTCP_SDES_NAME => "NAME",
+                                RTCP_SDES_EMAIL => "EMAIL",
+                                RTCP_SDES_PHONE => "PHONE",
+                                RTCP_SDES_LOC => "LOC",
+                                RTCP_SDES_TOOL => "TOOL",
+                                RTCP_SDES_NOTICE => "NOTICE",
+                                RTCP_SDES_PRIV => "PRIV",
+                                _ => "?",
+                            };
+                            if sdes_type < 8 {
+                                let sdes_str = match str::from_utf8(sdes) {
+                                    Ok(ss) => ss,
+                                    Err(_) => {
+                                        continue;
+                                    },
+                                };
+                                // TODO: Validate that there are no control characters.
+                                log::debug!("SDES info from peer rtcp://{}: {}={}", peer_addr, sdes_name, sdes_str);
+                            }
+                            s = &s[sdes_len..];
+                            actual_count += 1;
+                        }
+                        if actual_count != reported_count {
+                            log::warn!("The reported source count in SDES packet sent by peer rtcp://{} does not match the actual source count contained", peer_addr);
+                        }
+                        // TODO: Use
+                    },
+                    RTCP_PT_BYE => { // Goodbye
+                        let ssrc_count = rtcp_header.flags & 0b0001_1111;
+                        if len < (ssrc_count as usize * 4) + 4 {
+                            log::warn!("Malformed (short) BYE RTCP packet from peer {}", peer_addr);
+                            continue;
+                        }
+                        let mut i = 4;
+                        while i < len {
+                            let ssrc: u32 = u32::from_be_bytes([
+                                rtcp_buf[i], rtcp_buf[i+1], rtcp_buf[i+2], rtcp_buf[i+3] ]);
+                            log::info!("Goodbye received for SSRC {} from rtcp://{}", ssrc, peer_addr);
+                            i += 4;
+                        }
+                        if len > (ssrc_count as usize * 4) + 5 { // If we have a reason string
+                            let start_of_reason = (ssrc_count as usize * 4) + 5;
+                            let reason_len = std::cmp::min( // Take the lesser of the reported length or packet length
+                                rtcp_buf[(ssrc_count as usize * 4) + 4] as usize, // reason length field
+                                len - start_of_reason // length of packet, minus everything before reason
+                            );
+                            let reason = match str::from_utf8(&rtcp_buf[start_of_reason..start_of_reason+reason_len]) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    log::warn!("Invalid reason string in BYE RTCP packet from peer {}", peer_addr);
+                                    continue;
+                                },
+                            };
+                            log::info!("BYE RTCP packet received from peer {} for reason \"{}\"", peer_addr, reason);
+                        }
+                    },
+                    RTCP_PT_APP => { // Application Data
+                        if len < 12 {
+                            log::warn!("Malformed (short) APP RTCP packet received from peer {}", peer_addr);
+                            continue;
+                        }
+                        let subtype = rtcp_header.flags & 0b0001_1111;
+                        let name_bytes = &rtcp_buf[8..12];
+                        if !name_bytes.iter().all(|b| (*b).is_ascii_graphic()) {
+                            log::warn!("Peer {} sent an APP RTCP packet with a name field that is not graphical ASCII", peer_addr);
+                            continue;
+                        }
+                        let name = str::from_utf8(name_bytes).expect("Graphical ASCII was not valid UTF-8 apparently!");
+                        log::warn!("Unrecognized APP RTCP packet with subtype {} and name {} from peer {}",
+                            subtype, name, peer_addr);
+                    },
+                    _ => {
+                        log::debug!("Unrecognized RTCP packet type {} from peer {}",
+                            rtcp_header.packet_type, peer_addr);
+                    }
+                };
             }
         }
     };
 }
 
-async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, CancellationToken)> {
-    // TODO: Pick an unused port
-    let port = 9099;
-    let socket_addr = SocketAddr::new([127,0,0,1].into(), port);
+async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, CancellationToken)> {
+    let port = 0; // This means "give me any port."
+    let ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: Make this configurable.
+    let socket_addr = SocketAddr::new(ip.into(), port); 
     let socket = UdpSocket::bind(socket_addr).await?;
-    println!("Listening for RTP traffic on {}", socket_addr);
+
+    let assigned_port = socket.local_addr()?.port();
+
+    let rtcp_socket: UdpSocket;
+    /* "For UDP and similar protocols, RTP SHOULD use an even destination port
+    number and the corresponding RTCP stream SHOULD use the next higher (odd)
+    destination port number." -- IETF RFC 3550 */
+    let rtp_socket = if (assigned_port % 2) == 1 { // If the assigned port is odd
+        println!("Listening for RTCP traffic on {}", socket_addr);
+        rtcp_socket = socket;
+        let socket_addr = SocketAddr::new(ip.into(), assigned_port - 1);
+        let rtp_sock = UdpSocket::bind(socket_addr).await?;
+        println!("Listening for RTP traffic on {}", socket_addr);
+        rtp_sock
+    } else {
+        println!("Listening for RTP traffic on {}", socket_addr);
+        let socket_addr = SocketAddr::new(ip.into(), assigned_port + 1);
+        rtcp_socket = UdpSocket::bind(socket_addr).await?;
+        println!("Listening for RTCP traffic on {}", socket_addr);
+        socket
+    };
+
+    let rtp_port = rtp_socket.local_addr()?.port();
+    let rtcp_port = rtcp_socket.local_addr()?.port();
+    
     let token = CancellationToken::new();
 
     let ring = HeapRb::<u8>::new(1200);
@@ -263,7 +468,13 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, Cancella
     let config = supported_configs
         .find(|c| c.channels() == 1 && c.sample_format() == SampleFormat::I16);
     let config = config.unwrap().with_sample_rate(SampleRate(8000)).into();
-    tokio::spawn(receive_rtp_packets(peer_addr, socket, token.clone(), producer));
+    tokio::spawn(receive_rtp_packets(
+        peer_addr,
+        rtp_socket,
+        rtcp_socket,
+        token.clone(),
+        producer,
+    ));
 
     /* If this approach seems abstruse, let me assure you I did not want to do
     it this way. See: https://github.com/RustAudio/cpal/issues/818 */
@@ -309,7 +520,7 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, Cancella
         thread2.thread().unpark();
     });
 
-    Ok((port, token))
+    Ok((rtp_port, rtcp_port, token))
 }
 
 async fn handle_open_logical_channel (
@@ -399,7 +610,7 @@ async fn handle_open_logical_channel (
             match audio.variant.unwrap() {
                 mediacontrol::audio_capability::Variant::G711Alaw56k(fpp) => {
                     // It seems like the called party gets to assign the RTP port.
-                    let (port, canceller) = listen_for_rtp(peer_addr).await.unwrap(); // TODO: Handle error
+                    let (rtp_port, rtcp_port, canceller) = listen_for_rtp(peer_addr).await.unwrap(); // TODO: Handle error
                     new_channel = ChannelState{
                         olc: mc,
                         recv: RTPStreamState{
@@ -411,7 +622,7 @@ async fn handle_open_logical_channel (
                         },
                         forward_to_port: None,
                     };
-                    tx.send((generate_olc_ack(6, fcn, port), peer_addr)).await;
+                    tx.send((generate_olc_ack(6, fcn, rtp_port, rtcp_port), peer_addr)).await;
                 },
                 _ => {
                     // TODO: Return error (data type not supported)
@@ -452,6 +663,30 @@ async fn handle_media_control (
         p::mediacontrol::media_control_message::Variant::OpenLogicalChannel(m)
             => {
                 handle_open_logical_channel(tx, peer_addr, call, message_id, m).await;
+            },
+        p::mediacontrol::media_control_message::Variant::CloseLogicalChannel(m)
+            => {
+                todo!()
+            },
+        p::mediacontrol::media_control_message::Variant::CloseLogicalChannelAck(m)
+            => {
+                todo!()
+            },
+        p::mediacontrol::media_control_message::Variant::RequestChannelClose(m)
+            => {
+                todo!()
+            },
+        p::mediacontrol::media_control_message::Variant::RequestChannelCloseAck(m)
+            => {
+                todo!()
+            },
+        p::mediacontrol::media_control_message::Variant::RequestChannelCloseReject(m)
+            => {
+                todo!()
+            },
+        p::mediacontrol::media_control_message::Variant::RequestChannelCloseRelease(m)
+            => {
+                todo!()
             },
         _ => {
 
@@ -507,6 +742,8 @@ async fn handle_packet (
     let call = call.unwrap();
     if let Some(body) = &cs.body {
         // TODO: Handle different CS messages
+        // TODO: Setup
+        // TODO: ReleaseComplete
     }
     for mcm in cs.media_control.into_iter() {
         handle_media_control(tx.clone(), peer_addr, call.clone(), mcm).await;

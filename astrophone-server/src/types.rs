@@ -53,3 +53,9 @@ pub struct PeerState {
 pub struct ServerState {
     pub peers: Arc<RwLock<HashMap<SocketAddr, PeerState>>>,
 }
+
+#[derive(Debug, Clone)]
+pub enum RoutableAddress {
+    Ip(SocketAddr),
+    HostAndPort(String, u16),
+}

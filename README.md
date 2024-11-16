@@ -32,8 +32,160 @@ transport and such.
 Current, I have a server that receives a Setup message from a new client, and
 sends CallProceeding, Alerting, and Connect messages in response, and it
 receives an OpenLogicalChannel message and opens an RTP port in response.
-It receives the RTP packets from this port and decodes them, but this is as
-far as I got.
+It receives the RTP packets from this port, decodes them, and plays them to
+your default audio device. Only the G.711 audio "codec" is supported at the
+moment.
 
 The "client" is basically just for testing. The code is intentionally the
-crappiest and low-effort, because I just want to get the server working.
+crappiest and low-effort, because I just want to get the server working, after
+which I will perfect the client.
+
+## Version 1.0.0
+
+- [ ] Server
+  - [ ] `ReleaseComplete` signalling message
+  - [ ] `CloseLogicalChannel`
+  - [ ] `RequestChannelClose`
+  - [ ] Proper logging
+  - [ ] Configuration or Discovery of Own IP address
+  - [ ] Handling of unknown messages
+  - [ ] RTCP
+- [ ] Client Library
+- [ ] CLI / Shell
+  - [ ] `call` Subcommand
+  - [ ] `help` Subcommand
+  - [ ] `hangup` Subcommand
+- [ ] Documentation
+
+## Version 1.1.0
+
+- [ ] Bidirectional calls
+
+## Version 1.2.0
+
+- [ ] dTLS Support
+
+## Version 1.3.0
+
+- [ ] Server
+  - [ ] Transport over HTTP/3
+  - [ ] Multi-User
+  - [ ] Relay / Gateway / MITM
+  - [ ] NAT Traversal
+- [ ] Client
+  - [ ] Transport over HTTP/3
+
+I think NAT Traversal is going to basically require me breaking RTP entirely or
+abusing its extensions or something. If you have somebody on your network
+connecting to a video conference with 100 people on it, they all have their
+cameras on, and they all have their microphones on, that's 200 ports you have to
+open up on your router to receive all these streams. Then multiply it by the
+number of people on your network doing this. Then double it for the control
+ports.
+
+Fortunately, one of the nice things about this approach is that you can just
+spin up two ports.
+
+And if we're going to break from tradition this much, we might as well use a
+Protobuf version of RTCP.
+
+But RTP still seems valuable though. Opinion online reveals that this protocol
+is purposely very minimal in the interest of performance, so using protobuf for
+a new "RTP" header is out of the question.
+
+I think I am just going to use SSRC for multiplexing. The arguments put forth in
+IETF RFC 3550, Section 5.2 are not very compelling.
+
+> UPDATE: It sounds like
+> [IETF RFC 8108](https://www.rfc-editor.org/rfc/rfc8108.txt) explicitly allows
+> using SSRCs for multiplexing. 
+
+With that established, now I wonder if I should use a Protobuf RTCP or the
+original RTCP. RTP is what I would consider to be a perfect protocol (other
+than not having clear multiplexing support): it is great for getting real-time
+data from one computer to another with the minimal amount of complexity. But
+RTCP is a little different: it is not sent frequently, and the packets have a
+few more fields and flexibility, so there is a lot more parsing burden.
+
+- Use old RTCP
+  - Better compatibility
+- Use Protobuf RTCP
+  - Easier implementation
+  - Use a single port for call signalling, media control, and RTCP.
+
+## Version 1.4.0
+
+- [ ] Server
+  - [ ] Conferencing
+
+## Version 1.5.0 and Beyond
+
+- [ ] G.711 u-Law Audio
+- [ ] G.711.0 Audio?
+- [ ] G.729 Audio?
+- [ ] Opus Audio
+- [ ] `RequestMode` (`stream` subcommand)
+- [ ] `RoundTripDelayRequest`
+- [ ] `MaintenanceLoopRequest`
+- [ ] `CommunicationModeRequest`
+- [ ] `ConferenceRequest`
+- [ ] `LogicalChannelRateRequest`
+- [ ] `MaintenanceLoopOffCommand`
+- [ ] `SendTerminalCapabilitySet`
+- [ ] `FlowControlCommand`
+- [ ] `EndSessionCommand`
+- [ ] `MiscellaneousCommand`
+- [ ] `CommunicationModeCommand`
+- [ ] `ConferenceCommand`
+- [ ] `FunctionNotUnderstood`
+- [ ] `TerminalCapabilitySetRelease`
+- [ ] `OpenLogicalChannelConfirm`
+- [ ] `RequestChannelCloseRelease`
+- [ ] `RequestModeRelease`
+- [ ] `MiscellaneousIndication`
+- [ ] `JitterIndication`
+- [ ] `UserInputIndication`
+- [ ] `H2250MaximumSkewIndication`
+- [ ] `MCLocationIndication`
+- [ ] `ConferenceIndication`
+- [ ] `VendorIdentification`
+- [ ] `FunctionNotSupported`
+- [ ] `LogicalChannelRateRelease`
+- [ ] `FlowControlIndication`
+- [ ] Voicemail
+- [ ] Real-Time Text
+- [ ] Real-Time Emoji / React
+- [ ] Drawing
+- [ ] Geolocation
+- [ ] Mute
+- [ ] Jitter Buffer
+- [ ] Call Hold
+- [ ] Call Transfer
+- [ ] Call Diversion
+- [ ] Call Intrusion
+- [ ] Call Waiting
+- [ ] Call Completion
+- [ ] Call Offer
+- [ ] Video Calls
+- [ ] Android App
+- [ ] iOS App
+- [ ] Apple TV App
+- [ ] Browser App
+- [ ] Desktop App
+- [ ] Debian Package
+- [ ] RPM Package
+- [ ] Nix Flake
+- [ ] Alpine APK
+- [ ] Brew Package
+- [ ] Chocolatey Package
+- [ ] Docker Container
+- [ ] SystemD Service
+- [ ] Windows Service
+- [ ] MacOS Service
+- [ ] TOR Integration
+- [ ] I2P Integration
+- [ ] SASL Authentication
+- [ ] C Library
+- [ ] TypeScript Library
+- [ ] Go Library
+- [ ] Encryption per https://www.rfc-editor.org/info/rfc9335

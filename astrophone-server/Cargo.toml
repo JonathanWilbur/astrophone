@@ -26,6 +26,7 @@ tokio-util = "0.7.12"
 audio-codec-algorithms = "0.6.0"
 cpal = "0.15.3"
 ringbuf = "0.4.7"
+bytemuck = { version = "1.14.1", features = ["derive", "must_cast"] }
 
 [build-dependencies]
 prost-build = "0.13"

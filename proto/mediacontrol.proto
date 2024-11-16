@@ -1064,6 +1064,8 @@ message H2250LogicalChannelAckParameters {
     optional TransportAddress mediaControlChannel = 3;
     optional uint32 dynamicRTPPayloadType = 4;
     bool flowControlToZero = 5;
+
+    // TODO: I kind of think you should just get rid of this. It is confusing and not used.
     optional uint32 portNumber = 6;
 }
 
