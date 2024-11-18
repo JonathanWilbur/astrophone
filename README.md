@@ -43,13 +43,19 @@ which I will perfect the client.
 ## Version 1.0.0
 
 - [ ] Server
-  - [ ] `ReleaseComplete` signalling message
-  - [ ] `CloseLogicalChannel`
-  - [ ] `RequestChannelClose`
+  - [x] `INVITE`
+  - [x] `ACK`
+    - [ ] What to do with the ports before this is received?
+    - [ ] Clean up session if `ACK` not received in time.
+  - [ ] `BYE`
+  - [ ] `CANCEL`
+  - [ ] `OPTIONS`
+  - [ ] Clean up dangling dialogs
   - [ ] Proper logging
   - [ ] Configuration or Discovery of Own IP address
   - [ ] Handling of unknown messages
   - [ ] RTCP
+  - [ ] G.711 u-Law (PCMU)
 - [ ] Client Library
 - [ ] CLI / Shell
   - [ ] `call` Subcommand

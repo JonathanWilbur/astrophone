@@ -1,27 +1,30 @@
-mod p;
 mod logging;
 mod rtcp;
 mod types;
 use crate::logging::get_default_log4rs_config;
 use ringbuf::SharedRb;
+use rsip::headers::{ContentLength, Supported};
+use rsip::prelude::{HasHeaders, HeadersExt, ToTypedHeader, UntypedHeader};
+use rsip::typed::content_disposition::DisplayType;
 use rtcp::{RTCPHeader, SenderReportHeader};
+use sdp_rs::lines::connection::ConnectionAddress;
+use sdp_rs::lines::media::ProtoType;
+use sdp_rs::lines::{Attribute, Connection, Media};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use types::RTPStreamState;
+use types::{CallStatus, RTPStreamState};
 use core::str;
 use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use prost::{bytes::BytesMut, Message};
 use anyhow;
 use std::collections::HashMap;
 use uuid::Uuid;
 use tokio::sync::{Mutex, mpsc};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use p::callsig;
-use p::mediacontrol;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use crate::types::{PeerState, ChannelState, CallState, ServerState};
 use audio_codec_algorithms::decode_alaw;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -48,181 +51,66 @@ use rtcp::{
     RTCP_SDES_NOTICE,
     RTCP_SDES_PRIV,
 };
+use tokio::net::TcpListener;
+use rsip::{
+    Header, Headers, Host, Method, Port, Request, Response, StatusCode, Transport, Version
+};
+use rsip::typed::{Accept, Allow, CSeq, Contact, ContentDisposition, ContentType, MediaType, Via};
+use local_ip_address::local_ip;
+use sdp_rs::{MediaDescription, SessionDescription};
 
-const server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50051));
 
-fn generate_err_message (
-    message_id: u32,
-    code: callsig::CallSignallingErrorCode,
-    message: Option<String>
-) -> Vec<u8> {
-    let e = callsig::CallSignallingError{
-        message_id,
-        code: code.into(),
-        message: message.unwrap_or_default(),
-        ..Default::default()
-    };
-    let cs = callsig::CallSignalling{
-        message_id,
-        call_id: None,
-        body: Some(callsig::call_signalling::Body::Error(e)),
-        media_control: vec![],
-        call_linkage: None,
-    };
-    cs.encode_to_vec()
-}
 
-fn generate_call_proceeding (message_id: u32) -> Vec<u8> {
-    let m = callsig::CallProceeding{};
-    let cs = callsig::CallSignalling{
-        message_id,
-        call_id: None,
-        body: Some(callsig::call_signalling::Body::CallProceeding(m)),
-        media_control: vec![],
-        call_linkage: None,
-    };
-    cs.encode_to_vec()
-}
+const udp_server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50051));
+const tcp_server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50052));
 
-fn generate_alerting (message_id: u32) -> Vec<u8> {
-    let m = callsig::Alerting{
-        ..Default::default()
-    };
-    let cs = callsig::CallSignalling{
-        message_id,
-        call_id: None,
-        body: Some(callsig::call_signalling::Body::Alerting(m)),
-        media_control: vec![],
-        call_linkage: None,
-    };
-    cs.encode_to_vec()
-}
+// async fn handle_setup (
+//     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+//     peer_addr: SocketAddr,
+//     peer: PeerState,
+//     setup: callsig::Setup,
+//     call_id: Uuid,
+//     message_id: u32,
+// ) -> anyhow::Result<()> {
+//     tx.send((generate_call_proceeding(1), peer_addr)).await?;
+//     tx.send((generate_alerting(2), peer_addr)).await?;
 
-fn generate_connect (message_id: u32) -> Vec<u8> {
-    let m = callsig::Connect{
-        // TODO: Include capabilities once you get this working.
-        capabilities: Some(mediacontrol::TerminalCapabilitySet{
-            sequence_number: 1,
-            protocol_identifier: vec![],
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let cs = callsig::CallSignalling{
-        message_id,
-        call_id: None,
-        body: Some(callsig::call_signalling::Body::Connect(m)),
-        media_control: vec![],
-        call_linkage: None,
-    };
-    cs.encode_to_vec()
-}
-
-fn generate_olc_ack (message_id: u32, fwcn: u32, rtp_port: u16, rtcp_port: u16) -> Vec<u8> {
-    let ip = mediacontrol::IpAddress { version: Some(mediacontrol::ip_address::Version::V4([ 127, 0, 0, 1 ].into())) };
-    let params = mediacontrol::H2250LogicalChannelAckParameters{
-        port_number: Some(rtp_port.into()),
-        media_channel: Some(mediacontrol::TransportAddress{
-            variant: Some(mediacontrol::transport_address::Variant::IpAddress(ip.to_owned())),
-            port: rtp_port.into(),
-            ..Default::default()
-        }),
-        media_control_channel: Some(mediacontrol::TransportAddress{
-            variant: Some(mediacontrol::transport_address::Variant::IpAddress(ip)),
-            port: rtcp_port.into(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    // let reverse = mediacontrol::ReverseLogicalChannelParameters{
-    //     logical_channel_number: 1, // Does this have to be unique among the FW channel numbers? Assign these in a better way
-    //     ..Default::default()
-    // };
-    let olc_ack = mediacontrol::OpenLogicalChannelAck{
-        forward_logical_channel_number: fwcn,
-        h2250_logical_channel_ack_parameters: Some(params),
-        reverse: None,
-        ..Default::default()
-    };
-    let m = mediacontrol::MediaControlMessage{
-        message_id, // TODO: Just make this automatically inferred from the CS message ID.
-        variant: Some(mediacontrol::media_control_message::Variant::OpenLogicalChannelAck(olc_ack)),
-        ..Default::default()
-    };
-    let cs = callsig::CallSignalling{
-        message_id,
-        media_control: vec![ m ],
-        ..Default::default()
-    };
-    cs.encode_to_vec()
-}
-
-fn generate_release_complete (
-    message_id: u32,
-    reason: callsig::ReleaseCompleteReason,
-) -> Vec<u8> {
-    let m = callsig::ReleaseComplete{
-        reason: reason.into(),
-        ..Default::default()
-    };
-    let cs = callsig::CallSignalling{
-        message_id,
-        call_id: None,
-        body: Some(callsig::call_signalling::Body::ReleaseComplete(m)),
-        media_control: vec![],
-        call_linkage: None,
-    };
-    cs.encode_to_vec()
-}
-
-async fn handle_setup (
-    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    peer_addr: SocketAddr,
-    peer: PeerState,
-    setup: callsig::Setup,
-    call_id: Uuid,
-    message_id: u32,
-) -> anyhow::Result<()> {
-    tx.send((generate_call_proceeding(1), peer_addr)).await?;
-    tx.send((generate_alerting(2), peer_addr)).await?;
-
-    println!("Accept call from udp://{} ?", peer_addr);
-    if setup.caller_name.len() > 0 {
-        println!("The caller has self-identified as \"{}\".", setup.caller_name);
-    }
-    println!("Press y to accept or n to reject and press ENTER.");
-    let choice: char = tokio::io::stdin().read_u8().await
-        .map(|b| b.into())
-        .unwrap_or('\0');
-    match choice {
-        'y' | 'Y' => {
-            println!("Accepting the call from udp://{},", peer_addr);
-            tx.send((generate_connect(3), peer_addr)).await?;
-        },
-        'n' | 'N' => {
-            println!("Rejecting the call from udp://{}.", peer_addr);
-            let r = generate_release_complete(3, callsig::ReleaseCompleteReason::ReleaseCompleteDestinationRejection);
-            tx.send((r, peer_addr)).await?;
-        },
-        _ => {
-            println!("Error reading user input. Rejecting the call from udp://{}.", peer_addr);
-            let r = generate_release_complete(3, callsig::ReleaseCompleteReason::ReleaseCompleteUndefinedReason);
-            tx.send((r, peer_addr)).await?;
-        }
-    };
-    let call = CallState{
-        id: call_id,
-        capabilities: setup.capabilities.clone(),
-        channels: HashMap::new(),
-        expected_message_id: Arc::new(AtomicU32::new(message_id)),
-        forward_to_ip: None,
-        local_is_master: true,
-    };
-    let mut calls_map = peer.calls.write().await;
-    calls_map.insert(call_id, Arc::new(Mutex::new(call)));
-    Ok(())
-}
-
+//     println!("Accept call from udp://{} ?", peer_addr);
+//     if setup.caller_name.len() > 0 {
+//         println!("The caller has self-identified as \"{}\".", setup.caller_name);
+//     }
+//     println!("Press y to accept or n to reject and press ENTER.");
+//     let choice: char = tokio::io::stdin().read_u8().await
+//         .map(|b| b.into())
+//         .unwrap_or('\0');
+//     match choice {
+//         'y' | 'Y' => {
+//             println!("Accepting the call from udp://{},", peer_addr);
+//             tx.send((generate_connect(3), peer_addr)).await?;
+//         },
+//         'n' | 'N' => {
+//             println!("Rejecting the call from udp://{}.", peer_addr);
+//             let r = generate_release_complete(3, callsig::ReleaseCompleteReason::ReleaseCompleteDestinationRejection);
+//             tx.send((r, peer_addr)).await?;
+//         },
+//         _ => {
+//             println!("Error reading user input. Rejecting the call from udp://{}.", peer_addr);
+//             let r = generate_release_complete(3, callsig::ReleaseCompleteReason::ReleaseCompleteUndefinedReason);
+//             tx.send((r, peer_addr)).await?;
+//         }
+//     };
+//     let call = CallState{
+//         id: call_id,
+//         capabilities: setup.capabilities.clone(),
+//         channels: HashMap::new(),
+//         expected_message_id: Arc::new(AtomicU32::new(message_id)),
+//         forward_to_ip: None,
+//         local_is_master: true,
+//     };
+//     let mut calls_map = peer.calls.write().await;
+//     calls_map.insert(call_id, Arc::new(Mutex::new(call)));
+//     Ok(())
+// }
 
 fn handle_rtp_packet <'a> (
     rtp_packet: &'a rtp_rs::RtpReader<'a>,
@@ -428,7 +316,7 @@ async fn receive_rtp_packets (
 
 async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, CancellationToken)> {
     let port = 0; // This means "give me any port."
-    let ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: Make this configurable.
+    let ip = Ipv4Addr::new(0, 0, 0, 0); // TODO: Make this configurable.
     let socket_addr = SocketAddr::new(ip.into(), port); 
     let socket = UdpSocket::bind(socket_addr).await?;
 
@@ -458,7 +346,7 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, Can
     
     let token = CancellationToken::new();
 
-    let ring = HeapRb::<u8>::new(1200);
+    let ring = HeapRb::<u8>::new(24000);
     let (mut producer, mut consumer) = ring.split();
 
     let host = cpal::default_host();
@@ -523,271 +411,531 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, Can
     Ok((rtp_port, rtcp_port, token))
 }
 
-async fn handle_open_logical_channel (
+async fn handle_ack (
+    server: ServerState,
+    req: Request,
+    peer: PeerState,
     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    peer_addr: SocketAddr,
-    call: Arc<Mutex<CallState>>,
-    message_id: u32,
-    mc: mediacontrol::OpenLogicalChannel,
-) {
-    if mc.forward.is_none() {
-        println!("Missing forward parameters from OLC from peer {}.", peer_addr);
-        // TODO: Return error
-        return;
-    }
-    if mc.separate_stack.is_some() {
-        println!("Use of separateStack from peer {} is unsupported.", peer_addr);
-        // TODO: Return error (unsupported)
-        return;
-    }
-    if mc.encryption_sync.is_some() {
-        println!("Use of encryptionSync from peer {} is unsupported.", peer_addr);
-        // TODO: Return error (unsupported)
-        return;
-    }
-
-    let fcn = mc.forward_logical_channel_number;
-    let mediacontrol::OpenLogicalChannel {
-        forward,
-        reverse,
-        ..
-    } = mc.clone();
-    if reverse.is_some() {
-        println!("Reverse logical channel not supported in OLC from peer {}.", peer_addr);
-        return;
-    }
-    let forward = forward.unwrap();
-    let flcd = forward.forward_logical_channel_dependency;
-    if forward.data_type.is_none() {
-        println!("Missing dataType field in forward OLC parameters from peer {}", peer_addr);
-        // TODO: Return error
-        return;
-    }
-    let forward_data_type = forward.data_type.unwrap();
-    if forward_data_type.variant.is_none() {
-        println!("Missing dataType field in forward OLC parameters from peer {}", peer_addr);
-        // TODO: Return error
-        return;
-    }
-    let forward_data_type = forward_data_type.variant.unwrap();
-    // if forward.multiplex_parameters.is_none() {
-    //     println!("Missing multiplexParameters in forward OLC from peer {}.", peer_addr);
-    //     return;
-    // }
-    // let fwdmux = forward.multiplex_parameters.unwrap();
-    // // TODO: Actually use this.
-
-    // if fwdmux.media_guaranteed_delivery() || fwdmux.media_control_guaranteed_delivery() {
-    //     println!("Cannot guaranteed media or media control delivery from peer {}.", peer_addr);
-    //     return;
-    // }
-    // if fwdmux.redundancy_encoding.is_some() {
-    //     println!("Cannot handle redundancy encoding from peer {}.", peer_addr);
-    //     return;
-    // }
-    // TODO: I am not sure what silenceSuppression should be.
-    // TODO: Validate mediaPacketization.
-
+    transport: Transport,
+) -> anyhow::Result<()> {
+    let call_id = req.call_id_header()?;
+    let cseq = req.cseq_header()?;
+    // let from = req.from_header()?;
+    // let to = req.to_header()?;
+    // let via = req.via_header()?;
+    let calls = peer.calls.read().await;
+    let maybe_call = calls.get(&call_id.to_string());
+    let call = match maybe_call {
+        Some(c) => c,
+        None => {
+            log::warn!("No such call with identifier {}", call_id.to_string());
+            // TODO: Send error response.
+            return Ok(());
+        }
+    };
     let mut call = call.lock().await;
-    if call.channels.contains_key(&fcn) {
-        // TODO: Return error (dup channel ID)
-        println!("Duplicate forward logical channel number {} from peer {}.", fcn, peer_addr);
-        return;
-    }
-    if flcd > 0 && !call.channels.contains_key(&flcd) {
-        println!("Dependency on channel {} not met for OLC from peer {}.",
-            forward.forward_logical_channel_dependency, peer_addr);
-        // TODO: Return error (dependency not met)
-        return;
-    }
-    let new_channel: ChannelState;
-    match forward_data_type {
-        mediacontrol::data_type::Variant::Audio(audio) => {
-            if audio.variant.is_none() {
-                println!("Malformed audio variant from peer {}.", peer_addr);
-                return;
+    match &call.status {
+        CallStatus::WaitingForAck(expected_cseq) => {
+            if cseq.typed().unwrap() != *expected_cseq { // TODO: Handle error
+                // TODO: Send error response
             }
-            match audio.variant.unwrap() {
-                mediacontrol::audio_capability::Variant::G711Alaw56k(fpp) => {
-                    // It seems like the called party gets to assign the RTP port.
-                    let (rtp_port, rtcp_port, canceller) = listen_for_rtp(peer_addr).await.unwrap(); // TODO: Handle error
-                    new_channel = ChannelState{
-                        olc: mc,
-                        recv: RTPStreamState{
-                            expected_sequence_number: 0,
-                            initial_ssrc: 0,
-                            initial_timestamp: 0,
-                            stream_start_time: Instant::now(),
-                            canceller,
-                        },
-                        forward_to_port: None,
-                    };
-                    tx.send((generate_olc_ack(6, fcn, rtp_port, rtcp_port), peer_addr)).await;
+            call.status = CallStatus::InProgress;
+            // TODO: Set up RTP stream.
+            // listen_for_rtp(peer.addr).await?;
+        },
+        _ => {}, // TODO: Other scenarios need to be handled too.
+    };
+    Ok(())
+    // drop(calls);
+}
+
+///  From IETF RFC 3261:
+///
+///  > In this specification, the BYE method terminates a session and the dialog
+///  > associated with it.
+/// 
+async fn handle_bye (
+    server: ServerState,
+    req: Request,
+    peer: PeerState,
+) -> anyhow::Result<()> {
+    let call_id = req.call_id_header()?;
+    let mut calls = peer.calls.write().await;
+    let maybe_call = calls.remove(&call_id.to_string());
+    if maybe_call.is_none() {
+        log::warn!("No such call with identifier {}", call_id.to_string());
+        // TODO: Send error response.
+    };
+    /* In theory, nothing else should be needed to drop the resources used by
+    the call. We use DropGuards in CallState so that the RTP sockets get closed
+    when the call is ended. */
+    Ok(())
+}
+
+async fn handle_cancel (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_info (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_invite (
+    server: ServerState,
+    mut req: Request,
+    peer: PeerState,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    transport: Transport,
+) -> anyhow::Result<()> {
+    let req_body = std::mem::take(&mut req.body);
+    let call_id = req.call_id_header()?;
+    let cseq = req.cseq_header()?;
+    let from = req.from_header()?;
+    let to = req.to_header()?;
+    let via = req.via_header()?;
+    let content_type = req.headers.iter().find_map(|h| {
+        match h {
+            Header::ContentType(ct) => Some(ct),
+            _ => None,
+        }
+    });
+    match content_type {
+        Some(ct) => {
+            let ct = ct.typed().unwrap().0; // TODO: Handle error?
+            match ct {
+                MediaType::Sdp(sdpct) => {
+                    // Do nothing. This is fine.
                 },
                 _ => {
-                    // TODO: Return error (data type not supported)
-                    println!("Unsupported audio data type from peer {}.", peer_addr);
-                    return;
-                }
+                    // TODO: Respond with error.
+                },
             };
         },
-        _ => {
-            // TODO: Return error (data type not supported)
-            println!("Unsupported non-audio data type from peer {}.", peer_addr);
-            return;
+        None => {
+            // TODO: Respond with error.
+        }
+    };
+    // Beyond this point, we are assuming the content type is SDP.
+    // TODO: Ensure that Content-Disposition is either missing or session.
+    let req_body = match String::from_utf8(req_body) {
+        Ok(s) => s,
+        Err(_) => {
+            // This is a requirement of sdp_rs, not the protocol itself.
+            // But it would be insane to have some other weird encoding.
+            log::warn!("Invalid INVITE body: not UTF-8 encoded");
+            // TODO: Send error response
+            return Ok(());
         },
     };
-    call.channels.insert(fcn, new_channel);
-    if forward.replacement_for > 0 {
-        call.channels.remove(&forward.replacement_for);
-    }
-    // I think portNumber is actually always going to be 0. I could be wrong.
-}
+    let mut sdreq = SessionDescription::from_str(req_body.as_str())?;
+    let mut reqmedia = std::mem::take(&mut sdreq.media_descriptions);
 
-async fn handle_media_control (
-    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    peer_addr: SocketAddr,
-    call: Arc<Mutex<CallState>>,
-    mc: mediacontrol::MediaControlMessage,
-) {
-    if mc.variant.is_none() {
-        let response = generate_err_message(0, callsig::CallSignallingErrorCode::CsErrProceduralError, None);
-        /* We intentionally do not handle failure to respond. It's okay if
-        we fail to respond to clients that are sending invalid packets. */
-        tx.send((response, peer_addr)).await;
-        return;
-    }
-    let message_id = mc.message_id;
-    let mc = mc.variant.unwrap();
-    match mc {
-        p::mediacontrol::media_control_message::Variant::OpenLogicalChannel(m)
-            => {
-                handle_open_logical_channel(tx, peer_addr, call, message_id, m).await;
-            },
-        p::mediacontrol::media_control_message::Variant::CloseLogicalChannel(m)
-            => {
-                todo!()
-            },
-        p::mediacontrol::media_control_message::Variant::CloseLogicalChannelAck(m)
-            => {
-                todo!()
-            },
-        p::mediacontrol::media_control_message::Variant::RequestChannelClose(m)
-            => {
-                todo!()
-            },
-        p::mediacontrol::media_control_message::Variant::RequestChannelCloseAck(m)
-            => {
-                todo!()
-            },
-        p::mediacontrol::media_control_message::Variant::RequestChannelCloseReject(m)
-            => {
-                todo!()
-            },
-        p::mediacontrol::media_control_message::Variant::RequestChannelCloseRelease(m)
-            => {
-                todo!()
-            },
-        _ => {
-
-        }
-    }
-}
-
-async fn handle_packet (
-    server: ServerState,
-    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    peer_addr: SocketAddr,
-    peer: Option<PeerState>,
-    cs: callsig::CallSignalling
-) {
-    if cs.call_id.is_none() {
-        todo!("handle error");
-    }
-    let call_id = cs.call_id.unwrap();
-    let call_id = Uuid::try_from(call_id.uuid).unwrap(); // TODO: Handle error
-    let call = if peer.is_none() {
-        None
-    } else {
-        let peer = peer.unwrap();
-        let call_map = peer.calls.read().await;
-        call_map.get(&call_id).cloned()
-    };
-    if call.is_none() { // If we never heard of this peer before...
-        if cs.body.is_none() {
-            let response = generate_err_message(0, callsig::CallSignallingErrorCode::CsErrInvalidCallState, None);
-            /* We intentionally do not handle failure to respond. It's okay if
-            we fail to respond to clients that are sending invalid packets. */
-            tx.send((response, peer_addr)).await;
-            // TODO: Close the socket whenever there is an error.
-            return;
-        }
-        let body = cs.body.unwrap();
-        let peer = PeerState{
-            addr: peer_addr,
-            calls: Arc::new(RwLock::new(HashMap::new())),
-        };
-        if let callsig::call_signalling::Body::Setup(setup) = body {
-            handle_setup(tx, peer_addr, peer.clone(), setup, call_id, cs.message_id).await; // TODO: Handle errors?
+    let mut drop_guards: Vec<DropGuard> = vec![];
+    for m in reqmedia.iter_mut() {
+        // FIXME: If sendonly (relative to who?), only open RTCP port.
+        let supported: bool = m.media.media == sdp_rs::lines::media::MediaType::Audio
+            && m.media.proto == ProtoType::RtpAvp
+            && m.media.fmt.split(" ").any(|f| f == "8");
+        let attrs = std::mem::take(&mut m.attributes);
+        let (rtp_port, rtcp_port, cancel) = if supported {
+            // This function name is deceptive. It also listens for RTCP.
+            listen_for_rtp(peer.addr).await?
         } else {
-            let response = generate_err_message(0, callsig::CallSignallingErrorCode::CsErrInvalidCallState, None);
-            /* We intentionally do not handle failure to respond. It's okay if
-            we fail to respond to clients that are sending invalid packets. */
-            tx.send((response, peer_addr)).await;
+            (0, 0, CancellationToken::new())
+        };
+        drop_guards.push(cancel.drop_guard());
+        let media = Media{
+            media: m.media.media.to_owned(),
+            port: rtp_port,
+            num_of_ports: None, // TODO: Is this right?
+            proto: ProtoType::RtpAvp,
+            // TODO: Actually check that 8 was among the options.
+            fmt: "8".to_string(), // Payload Type 8 = G.711 A-Law (PCMA)
+        };
+        m.media = media;
+        // TODO: Validate no contradicting attributes
+        let mut direction: Attribute = Attribute::Sendrecv;
+        for attr in attrs.iter() {
+            match attr {
+                Attribute::Recvonly
+                | Attribute::Sendonly
+                | Attribute::Sendrecv
+                | Attribute::Inactive => direction = attr.to_owned(),
+                _ => {},
+            }
         }
-        let mut peer_map = server.peers.write().await;
-        peer_map.insert(peer_addr, peer);
-        return;
+        m.attributes.push(direction);
+        m.attributes.push(Attribute::Other("rtcp".into(), Some(rtcp_port.to_string())));
     }
-    let call = call.unwrap();
-    if let Some(body) = &cs.body {
-        // TODO: Handle different CS messages
-        // TODO: Setup
-        // TODO: ReleaseComplete
+    // TODO: Ensure its V0
+    // TODO: Reject if NOT t=0 0 (we will implement session scheduling later)
+    // TODO: Reject if there are zero medias
+    // TODO: Select media types and respond.
+    let mut new_call = CallState::new(call_id.clone());
+    new_call.drop_guards = drop_guards;
+    let new_call = Arc::new(Mutex::new(new_call));
+    let mut calls = peer.calls.write().await;
+    calls.insert(call_id.to_string(), new_call.clone());
+    drop(calls);
+
+    // TODO: Check if directed to this server
+    // TODO: Write Trying
+
+    // TODO: Via header
+    // Via: SIP/2.0/UDP 192.168.1.2;received=80.230.219.70;rport=5060;branch=z9hG4bKnp112903503-43a64480192.168.1.2
+    // let via = Via::from("");
+    let mut trying_headers = Headers::default();
+    trying_headers.push(Header::CallId(call_id.to_owned()));
+    trying_headers.push(Header::CSeq(cseq.to_owned()));
+    trying_headers.push(Header::From(from.to_owned()));
+    trying_headers.push(Header::To(to.to_owned()));
+    trying_headers.push(Header::ContentLength(ContentLength::new("0")));
+    trying_headers.push(via.clone().into()); // TODO: I don't think this is right.
+    let trying = Response{
+        status_code: StatusCode::Trying,
+        version: Version::V2,
+        headers: trying_headers,
+        body: vec![],
+        ..Default::default()
+    };
+    tx.send((trying.to_string().into_bytes(), peer.addr)).await?;
+    // TODO: Write Ringing
+
+    let my_local_ip = local_ip().unwrap(); // TODO: Handle errors
+    let my_host = Host::IpAddr(my_local_ip);
+    let base_uri = rsip::Uri {
+        scheme: Some(rsip::Scheme::Sip),
+        auth: Some(("bob", Option::<String>::None).into()),
+        host_with_port: rsip::HostWithPort::from((my_host, 50051)), // FIXME: Configurable port
+        ..Default::default()
+    };
+
+    let sdresp = SessionDescription{
+        version: sdp_rs::lines::Version::V0,
+        origin: sdreq.origin.to_owned(), // TODO: This has to be changed to this server, because we modify the SDP answer.
+        session_name: sdreq.session_name.to_owned(),
+        session_info: sdreq.session_info.to_owned(),
+        uri: sdreq.uri.to_owned(),
+        emails: sdreq.emails.to_owned(),
+        phones: sdreq.phones.to_owned(),
+        /* It seems that you MUST return this for clients to work. */
+        connection: Some(Connection{
+            addrtype: sdp_rs::lines::common::Addrtype::Ip4,
+            connection_address: ConnectionAddress{
+                base: my_local_ip,
+                numaddr: None,
+                ttl: None,
+            },
+            nettype: sdp_rs::lines::common::Nettype::In,
+        }),
+        bandwidths: vec![],
+        times: sdreq.times.to_owned(),
+        key: None,
+        attributes: vec![], // TODO: Maybe copy from the request?
+        media_descriptions: reqmedia,
+    };
+    let ok_body = sdresp.to_string().into_bytes();
+    let mut ok_headers = Headers::default();
+    ok_headers.push(Header::CallId(call_id.to_owned()));
+    ok_headers.push(Header::CSeq(cseq.to_owned()));
+    ok_headers.push(Header::From(from.to_owned()));
+    ok_headers.push(Header::To(to.to_owned()));
+    ok_headers.push(Header::ContentLength(ContentLength::new(ok_body.len().to_string().as_str())));
+    ok_headers.push(Contact{
+        display_name: Some("skwisgar".into()),
+        uri: base_uri.clone(),
+        params: vec![rsip::Param::Branch(rsip::param::Branch::new(
+            "z9hG4bKqoetijoqijiq", // TODO: Get this from the request.
+        ))],
+    }.into());
+    ok_headers.push(via.clone().into()); // TODO: I don't think this is right.
+    ok_headers.push(Allow(vec![ Method::Invite, Method::Ack, Method::Bye, Method::Cancel, Method::Options ]).into());
+    ok_headers.push(Supported::from("".to_string()).into());
+    ok_headers.push(Accept::from(vec![
+        MediaType::Sdp(vec![]), // Intentionally no parameters
+    ]).into());
+    ok_headers.push(ContentType(MediaType::Sdp(vec![])).into());
+    ok_headers.push(ContentDisposition{
+        display_type: DisplayType::Session,
+        display_params: vec![],
+    }.into());
+
+    let ok = Response{
+        status_code: StatusCode::OK,
+        version: Version::V2,
+        headers: ok_headers,
+        body: ok_body,
+        ..Default::default()
+    };
+    let mut call = new_call.lock().await;
+    call.status = CallStatus::WaitingForAck(cseq.typed().unwrap()); // TODO: Handle this error? What could even happen?
+    tx.send((ok.to_string().into_bytes(), peer.addr)).await?;
+    // TODO: Implement re-transmission described in https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
+    Ok(())
+}
+
+async fn handle_message (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_notify (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_options (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_prack (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_publish (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_refer (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_register (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_subscribe (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn handle_update (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+) {
+    unimplemented!()
+}
+
+async fn invalid_sequence (peer_addr: SocketAddr) {
+    unimplemented!()
+}
+
+async fn handle_request_and_errors (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    transport: Transport,
+) -> anyhow::Result<()> {
+    let peer = {
+        let peers_map = server.peers.read().await;
+        peers_map.get(&peer_addr).cloned()
+    };
+    match req.method {
+        Method::Ack => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            handle_ack(server, req, peer, tx, transport).await
+        },
+        Method::Bye => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            handle_bye(server, req, peer).await
+        },
+        Method::Cancel => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            unimplemented!()
+        },
+        Method::Info => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            unimplemented!()
+        },
+        Method::Invite => {
+            let peer: PeerState = if peer.is_none() {
+                log::info!("New peer {}", peer_addr);
+                let new_peer = PeerState{
+                    addr: peer_addr,
+                    calls: Arc::new(RwLock::new(HashMap::new())),
+                };
+                let mut peers = server.peers.write().await;
+                peers.insert(peer_addr, new_peer.to_owned());
+                new_peer
+            } else {
+                peer.unwrap()
+            };
+            handle_invite(server, req, peer, tx, transport).await
+        },
+        Method::Message => {
+            unimplemented!()
+        },
+        Method::Notify => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            unimplemented!()
+        },
+        Method::Options => {
+            unimplemented!()
+        },
+        Method::PRack => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            unimplemented!()
+        },
+        Method::Publish => {
+            unimplemented!()
+        },
+        Method::Refer => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            unimplemented!()
+        },
+        Method::Register => {
+            unimplemented!()
+        },
+        Method::Subscribe => {
+            unimplemented!()
+        },
+        Method::Update => {
+            if peer.is_none() {
+                invalid_sequence(peer_addr).await;
+                return Ok(());
+            }
+            let peer = peer.unwrap();
+            unimplemented!()
+        },
     }
-    for mcm in cs.media_control.into_iter() {
-        handle_media_control(tx.clone(), peer_addr, call.clone(), mcm).await;
-    }
+}
+
+async fn handle_request (
+    server: ServerState,
+    req: Request,
+    peer_addr: SocketAddr,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    transport: Transport,
+) {
+    match handle_request_and_errors(server, req, peer_addr, tx, transport).await {
+        Ok(_) => {},
+        Err(e) => {
+            log::error!("{}", e);
+        },
+    };
 }
 
 #[cfg(not(target_os = "wasi"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use prost::Message;
-    log4rs::init_config(get_default_log4rs_config()).unwrap();
-    let local_addr: SocketAddr = server_addr;
-    let mut buf = [0; 65536];
+
+    let mut udp_buf = [0; 65536];
     let state = ServerState{
         peers: Arc::new(RwLock::new(HashMap::new())),
     };
-    let receive_socket = Arc::new(UdpSocket::bind(local_addr).await.expect("Failed to bind"));
-    let send_socket = receive_socket.clone();
-    log::info!("Listening on {}", local_addr);
+
+    log4rs::init_config(get_default_log4rs_config()).unwrap();
+    let udp_local_addr: SocketAddr = udp_server_addr;
+    let tcp_local_addr: SocketAddr = tcp_server_addr;
+
+    let udp_receive_socket = Arc::new(UdpSocket::bind(udp_local_addr).await.expect("Failed to bind with UDP"));
+    let udp_send_socket = udp_receive_socket.clone();
+    log::info!("Listening on {}", udp_local_addr);
+
+    let tcp_listener = TcpListener::bind(tcp_local_addr).await.expect("Failed to bind with TCP");
+    log::info!("Listening on {}", tcp_local_addr);
 
     let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1_000);
     tokio::spawn(async move {
         while let Some((bytes, addr)) = rx.recv().await {
-            let len = send_socket.send_to(&bytes, &addr).await.unwrap();
+            let len = udp_send_socket.send_to(&bytes, &addr).await.unwrap();
             println!("{:?} bytes sent", len);
         }
     });
 
     loop {
-        let (len, peer_addr) = receive_socket.recv_from(&mut buf).await?;
-        let msg = BytesMut::from(&buf[0..len]);
-        match callsig::CallSignalling::decode(msg) {
-            Ok(cs) => {
-                let peer = {
-                    let peers_map = state.peers.read().await;
-                    peers_map.get(&peer_addr).cloned()
+        tokio::select! {
+            result = udp_receive_socket.recv_from(&mut udp_buf) => {
+                if result.is_err() {
+                    todo!()
+                }
+                let (len, peer_addr) = result.unwrap();
+                let req = match Request::try_from(&udp_buf[0..len]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("Failed to decode SIP message: {}", e);
+                        continue;
+                    },
                 };
-                tokio::spawn(handle_packet(state.clone(), tx.clone(), peer_addr, peer, cs));
-            },
-            Err(e) => {
-                log::warn!("Malformed packet from {} error: {}", peer_addr, e);
+                handle_request(state.to_owned(), req, peer_addr, tx.clone(), Transport::Udp).await;
+            }
+            result = tcp_listener.accept() => {
+                if result.is_err() {
+                    todo!()
+                }
+                let (tcp_socket, _) = result.unwrap();
+                // process_socket(tcp_socket).await;
+                unimplemented!()
             }
         }
-    }
+    };
     
     Ok(())
 }

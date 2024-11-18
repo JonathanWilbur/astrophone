@@ -10,9 +10,6 @@ name = "astrophone-server"
 path = "src/main.rs"
 
 [dependencies]
-tonic = "0.9"
-prost = "0.13"
-prost-types = "0.13"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0.71"
 log4rs = "1.2.0"
@@ -27,9 +24,9 @@ audio-codec-algorithms = "0.6.0"
 cpal = "0.15.3"
 ringbuf = "0.4.7"
 bytemuck = { version = "1.14.1", features = ["derive", "must_cast"] }
-
-[build-dependencies]
-prost-build = "0.13"
+rsip = "0.4.0"
+local-ip-address = "0.6.3"
+sdp-rs = "0.2.1"
 
 [dependencies.uuid]
 version = "1.11.0"
