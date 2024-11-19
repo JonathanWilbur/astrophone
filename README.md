@@ -47,8 +47,8 @@ which I will perfect the client.
   - [x] `ACK`
     - [ ] What to do with the ports before this is received?
     - [ ] Clean up session if `ACK` not received in time.
-  - [ ] `BYE`
-  - [ ] `CANCEL`
+  - [x] `BYE`
+  - [x] `CANCEL`
   - [ ] `OPTIONS`
   - [ ] Clean up dangling dialogs
   - [ ] Proper logging
@@ -56,6 +56,9 @@ which I will perfect the client.
   - [ ] Handling of unknown messages
   - [ ] RTCP
   - [ ] G.711 u-Law (PCMU)
+  - [ ] Handle Busy Line
+  - [ ] Handle Duplicate Call-ID among invites
+  - [ ] Configurable Username
 - [ ] Client Library
 - [ ] CLI / Shell
   - [ ] `call` Subcommand
@@ -126,38 +129,20 @@ few more fields and flexibility, so there is a lot more parsing burden.
 
 ## Version 1.5.0 and Beyond
 
+- [ ] `INFO`
+- [ ] `MESSAGE`
+- [ ] `NOTIFY`
+- [ ] `PRACK`
+- [ ] `PUBLISH`
+- [ ] `REFER`
+- [ ] `REGISTER`
+- [ ] `SUBSCRIBE`
+- [ ] `UPDATE`
+- [ ] Warning Codes
 - [ ] G.711 u-Law Audio
 - [ ] G.711.0 Audio?
 - [ ] G.729 Audio?
 - [ ] Opus Audio
-- [ ] `RequestMode` (`stream` subcommand)
-- [ ] `RoundTripDelayRequest`
-- [ ] `MaintenanceLoopRequest`
-- [ ] `CommunicationModeRequest`
-- [ ] `ConferenceRequest`
-- [ ] `LogicalChannelRateRequest`
-- [ ] `MaintenanceLoopOffCommand`
-- [ ] `SendTerminalCapabilitySet`
-- [ ] `FlowControlCommand`
-- [ ] `EndSessionCommand`
-- [ ] `MiscellaneousCommand`
-- [ ] `CommunicationModeCommand`
-- [ ] `ConferenceCommand`
-- [ ] `FunctionNotUnderstood`
-- [ ] `TerminalCapabilitySetRelease`
-- [ ] `OpenLogicalChannelConfirm`
-- [ ] `RequestChannelCloseRelease`
-- [ ] `RequestModeRelease`
-- [ ] `MiscellaneousIndication`
-- [ ] `JitterIndication`
-- [ ] `UserInputIndication`
-- [ ] `H2250MaximumSkewIndication`
-- [ ] `MCLocationIndication`
-- [ ] `ConferenceIndication`
-- [ ] `VendorIdentification`
-- [ ] `FunctionNotSupported`
-- [ ] `LogicalChannelRateRelease`
-- [ ] `FlowControlIndication`
 - [ ] Voicemail
 - [ ] Real-Time Text
 - [ ] Real-Time Emoji / React
@@ -191,7 +176,6 @@ few more fields and flexibility, so there is a lot more parsing burden.
 - [ ] TOR Integration
 - [ ] I2P Integration
 - [ ] SASL Authentication
-- [ ] C Library
-- [ ] TypeScript Library
-- [ ] Go Library
 - [ ] Encryption per https://www.rfc-editor.org/info/rfc9335
+- [ ] Call Records
+- [ ] Web Interface

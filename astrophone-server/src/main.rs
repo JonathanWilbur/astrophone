@@ -475,9 +475,9 @@ async fn handle_bye (
 async fn handle_cancel (
     server: ServerState,
     req: Request,
-    peer_addr: SocketAddr,
-) {
-    unimplemented!()
+    peer: PeerState,
+) -> anyhow::Result<()> {
+    handle_bye(server, req, peer).await
 }
 
 async fn handle_info (
@@ -792,7 +792,7 @@ async fn handle_request_and_errors (
                 return Ok(());
             }
             let peer = peer.unwrap();
-            unimplemented!()
+            handle_cancel(server, req, peer).await
         },
         Method::Info => {
             if peer.is_none() {
