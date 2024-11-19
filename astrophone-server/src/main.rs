@@ -3,7 +3,7 @@ mod rtcp;
 mod types;
 use crate::logging::get_default_log4rs_config;
 use ringbuf::SharedRb;
-use rsip::headers::{ContentLength, Supported};
+use rsip::headers::{AcceptEncoding, AcceptLanguage, ContentLength, Server, Supported};
 use rsip::prelude::{HasHeaders, HeadersExt, ToTypedHeader, UntypedHeader};
 use rsip::typed::content_disposition::DisplayType;
 use rtcp::{RTCPHeader, SenderReportHeader};
@@ -59,7 +59,18 @@ use rsip::typed::{Accept, Allow, CSeq, Contact, ContentDisposition, ContentType,
 use local_ip_address::local_ip;
 use sdp_rs::{MediaDescription, SessionDescription};
 
+const ALLOWED_METHODS: [rsip::Method; 5] = [
+    Method::Invite,
+    Method::Ack,
+    Method::Bye,
+    Method::Cancel,
+    Method::Options,
+];
 
+const SUPPORTED_OPTIONS: &str = "";
+const ACCEPT_ENCODING: &str = ""; // empty means "identity" encoding only.
+const ACCEPT_LANGUAGE: &str = "en";
+const SERVER: &str = "Astrophone (See https://github.com/JonathanWilbur/astrophone)";
 
 const udp_server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50051));
 const tcp_server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50052));
@@ -652,13 +663,11 @@ async fn handle_invite (
     ok_headers.push(Contact{
         display_name: Some("skwisgar".into()),
         uri: base_uri.clone(),
-        params: vec![rsip::Param::Branch(rsip::param::Branch::new(
-            "z9hG4bKqoetijoqijiq", // TODO: Get this from the request.
-        ))],
+        params: vec![],
     }.into());
     ok_headers.push(via.clone().into()); // TODO: I don't think this is right.
-    ok_headers.push(Allow(vec![ Method::Invite, Method::Ack, Method::Bye, Method::Cancel, Method::Options ]).into());
-    ok_headers.push(Supported::from("".to_string()).into());
+    ok_headers.push(Allow(ALLOWED_METHODS.to_vec()).into());
+    ok_headers.push(Supported::from(SUPPORTED_OPTIONS.to_string()).into());
     ok_headers.push(Accept::from(vec![
         MediaType::Sdp(vec![]), // Intentionally no parameters
     ]).into());
@@ -702,7 +711,62 @@ async fn handle_options (
     server: ServerState,
     req: Request,
     peer_addr: SocketAddr,
-) {
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    transport: Transport,
+) -> anyhow::Result<()> {
+    // See: https://datatracker.ietf.org/doc/html/rfc3261#section-8.1.1
+    // A valid SIP request formulated by a UAC MUST, at a minimum, contain
+    // the following header fields: To, From, CSeq, Call-ID, Max-Forwards,
+    // and Via; all of these header fields are mandatory in all SIP
+    // requests.
+    let call_id = req.call_id_header()?;
+    let cseq = req.cseq_header()?;
+    let from = req.from_header()?;
+    let to = req.to_header()?;
+    let via = req.via_header()?;
+
+    let my_local_ip = local_ip().unwrap(); // TODO: Handle errors
+    let my_host = Host::IpAddr(my_local_ip);
+    let base_uri = rsip::Uri {
+        scheme: Some(rsip::Scheme::Sip),
+        auth: Some(("bob", Option::<String>::None).into()), // FIXME:
+        host_with_port: rsip::HostWithPort::from((my_host, 50051)), // FIXME: Configurable port
+        ..Default::default()
+    };
+
+    let mut headers = Headers::default();
+    headers.push(Header::CallId(call_id.to_owned()));
+    headers.push(Header::CSeq(cseq.to_owned()));
+    headers.push(Header::From(from.to_owned()));
+    headers.push(Header::To(to.to_owned()));
+    headers.push(Header::ContentLength(ContentLength::new("0")));
+    headers.push(via.clone().into()); // TODO: I don't think this is right.
+    headers.push(Contact{
+        display_name: Some("goobis".into()), // TODO: 
+        uri: base_uri.clone(),
+        params: vec![],
+    }.into());
+    headers.push(Allow(ALLOWED_METHODS.to_vec()).into());
+    headers.push(Supported::from(SUPPORTED_OPTIONS.to_string()).into());
+    headers.push(Accept::from(vec![
+        MediaType::Sdp(vec![]), // Intentionally no parameters
+    ]).into());
+    headers.push(AcceptEncoding::new(ACCEPT_ENCODING).into());
+    headers.push(AcceptLanguage::new(ACCEPT_LANGUAGE).into());
+    headers.push(Server::new(SERVER).into());
+    // TODO: Allow-Events (when subscriptions are supported)
+
+    // TODO: Check busy status
+
+    let res = Response{
+        status_code: StatusCode::OK,
+        version: Version::V2,
+        headers,
+        body: vec![],
+        ..Default::default()
+    };
+    tx.send((res.to_string().into_bytes(), peer_addr)).await?;
+
     unimplemented!()
 }
 
@@ -829,7 +893,7 @@ async fn handle_request_and_errors (
             unimplemented!()
         },
         Method::Options => {
-            unimplemented!()
+            handle_options(server, req, peer_addr, tx, transport).await
         },
         Method::PRack => {
             if peer.is_none() {

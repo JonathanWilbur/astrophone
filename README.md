@@ -49,7 +49,7 @@ which I will perfect the client.
     - [ ] Clean up session if `ACK` not received in time.
   - [x] `BYE`
   - [x] `CANCEL`
-  - [ ] `OPTIONS`
+  - [x] `OPTIONS`
   - [ ] Clean up dangling dialogs
   - [ ] Proper logging
   - [ ] Configuration or Discovery of Own IP address
