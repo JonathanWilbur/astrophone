@@ -1,0 +1,9 @@
+sip_tcp = { }
+sip_udp = { }
+local_name = "jonathan"
+inactivity_timeout = 5
+# private_dns_name: None,
+# public_dns_name: None,
+# private_network_ips: vec![],
+# stun_servers: vec![],
+# local_display_name: None,

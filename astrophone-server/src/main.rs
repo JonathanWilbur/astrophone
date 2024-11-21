@@ -9,12 +9,15 @@ use rsip::typed::content_disposition::DisplayType;
 use rtcp::{RTCPHeader, SenderReportHeader};
 use sdp_rs::lines::connection::ConnectionAddress;
 use sdp_rs::lines::media::ProtoType;
-use sdp_rs::lines::{Attribute, Connection, Media};
+use sdp_rs::lines::{Attribute, Connection, Media, Origin, Version};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
+use tokio::task::AbortHandle;
+use tokio::time::sleep;
 use types::{CallStatus, RTPStreamState};
 use core::str;
-use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+use std::io::{self, ErrorKind};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -53,12 +56,16 @@ use rtcp::{
 };
 use tokio::net::TcpListener;
 use rsip::{
-    Header, Headers, Host, Method, Port, Request, Response, StatusCode, Transport, Version
+    Domain, Header, Headers, Host, Method, Port, Request, Response, StatusCode, Transport
 };
 use rsip::typed::{Accept, Allow, CSeq, Contact, ContentDisposition, ContentType, MediaType, Via};
 use local_ip_address::local_ip;
-use sdp_rs::{MediaDescription, SessionDescription};
+use sdp_rs::{MediaDescription, SessionDescription, Time};
+use tokio::fs::read_to_string;
+use std::path::PathBuf;
+use types::Config;
 
+const MAX_CALLS_PER_PEER: usize = 3;
 const ALLOWED_METHODS: [rsip::Method; 5] = [
     Method::Invite,
     Method::Ack,
@@ -72,56 +79,26 @@ const ACCEPT_ENCODING: &str = ""; // empty means "identity" encoding only.
 const ACCEPT_LANGUAGE: &str = "en";
 const SERVER: &str = "Astrophone (See https://github.com/JonathanWilbur/astrophone)";
 
-const udp_server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50051));
-const tcp_server_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50052));
+/// Source: https://datatracker.ietf.org/doc/html/rfc3261#section-17.1.1.1
+const DEFAULT_T1_MILLISECONDS: u32 = 500;
 
-// async fn handle_setup (
-//     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-//     peer_addr: SocketAddr,
-//     peer: PeerState,
-//     setup: callsig::Setup,
-//     call_id: Uuid,
-//     message_id: u32,
-// ) -> anyhow::Result<()> {
-//     tx.send((generate_call_proceeding(1), peer_addr)).await?;
-//     tx.send((generate_alerting(2), peer_addr)).await?;
+/// Source: https://datatracker.ietf.org/doc/html/rfc3261#section-17.1.2.2
+const DEFAULT_T2_MILLISECONDS: u32 = 4000;
 
-//     println!("Accept call from udp://{} ?", peer_addr);
-//     if setup.caller_name.len() > 0 {
-//         println!("The caller has self-identified as \"{}\".", setup.caller_name);
-//     }
-//     println!("Press y to accept or n to reject and press ENTER.");
-//     let choice: char = tokio::io::stdin().read_u8().await
-//         .map(|b| b.into())
-//         .unwrap_or('\0');
-//     match choice {
-//         'y' | 'Y' => {
-//             println!("Accepting the call from udp://{},", peer_addr);
-//             tx.send((generate_connect(3), peer_addr)).await?;
-//         },
-//         'n' | 'N' => {
-//             println!("Rejecting the call from udp://{}.", peer_addr);
-//             let r = generate_release_complete(3, callsig::ReleaseCompleteReason::ReleaseCompleteDestinationRejection);
-//             tx.send((r, peer_addr)).await?;
-//         },
-//         _ => {
-//             println!("Error reading user input. Rejecting the call from udp://{}.", peer_addr);
-//             let r = generate_release_complete(3, callsig::ReleaseCompleteReason::ReleaseCompleteUndefinedReason);
-//             tx.send((r, peer_addr)).await?;
-//         }
-//     };
-//     let call = CallState{
-//         id: call_id,
-//         capabilities: setup.capabilities.clone(),
-//         channels: HashMap::new(),
-//         expected_message_id: Arc::new(AtomicU32::new(message_id)),
-//         forward_to_ip: None,
-//         local_is_master: true,
-//     };
-//     let mut calls_map = peer.calls.write().await;
-//     calls_map.insert(call_id, Arc::new(Mutex::new(call)));
-//     Ok(())
-// }
+#[cfg(not(target_family = "unix"))]
+const CONFIG_LOCATIONS: [ &str; 1 ] = [
+    "./astrophone",
+];
+#[cfg(target_family = "unix")]
+const CONFIG_LOCATIONS: [ &str; 2 ] = [
+    "./astrophone",
+    "/etc/astrophone",
+];
+
+const CONFIG_SUFFIXES: [ &str; 2 ] = [
+    ".toml",
+    ".config.toml",
+];
 
 fn handle_rtp_packet <'a> (
     rtp_packet: &'a rtp_rs::RtpReader<'a>,
@@ -156,7 +133,7 @@ async fn receive_rtp_packets (
             val = socket.recv_from(&mut rtp_buf) => {
                 let (len, peer_addr) = val.unwrap(); // TODO: Handle
                 if peer_addr.ip() != correct_peer_addr.ip() {
-                    println!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
+                    log::warn!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
                     continue; // Just ignore packets from naughtybois.
                 }
                 match rtp_rs::RtpReader::new(&rtp_buf[0..len]) {
@@ -166,7 +143,7 @@ async fn receive_rtp_packets (
                         producer.push_slice(rtp_packet.payload());
                     },
                     Err(e) => {
-                        println!("Error decoding RTP packet: {:?}", e); // TODO: Handle this some other way.
+                        log::warn!("Error decoding RTP packet: {:?}", e); // TODO: Handle this some other way.
                     },
                 };
             },
@@ -325,7 +302,10 @@ async fn receive_rtp_packets (
     };
 }
 
-async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, CancellationToken)> {
+async fn listen_for_rtp (
+    server: ServerState,
+    peer_addr: SocketAddr,
+) -> anyhow::Result<(u16, u16, CancellationToken)> {
     let port = 0; // This means "give me any port."
     let ip = Ipv4Addr::new(0, 0, 0, 0); // TODO: Make this configurable.
     let socket_addr = SocketAddr::new(ip.into(), port); 
@@ -338,17 +318,17 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, Can
     number and the corresponding RTCP stream SHOULD use the next higher (odd)
     destination port number." -- IETF RFC 3550 */
     let rtp_socket = if (assigned_port % 2) == 1 { // If the assigned port is odd
-        println!("Listening for RTCP traffic on {}", socket_addr);
+        log::info!("Listening for RTCP traffic on {}", socket_addr);
         rtcp_socket = socket;
         let socket_addr = SocketAddr::new(ip.into(), assigned_port - 1);
         let rtp_sock = UdpSocket::bind(socket_addr).await?;
-        println!("Listening for RTP traffic on {}", socket_addr);
+        log::info!("Listening for RTP traffic on {}", socket_addr);
         rtp_sock
     } else {
-        println!("Listening for RTP traffic on {}", socket_addr);
+        log::info!("Listening for RTP traffic on {}", socket_addr);
         let socket_addr = SocketAddr::new(ip.into(), assigned_port + 1);
         rtcp_socket = UdpSocket::bind(socket_addr).await?;
-        println!("Listening for RTCP traffic on {}", socket_addr);
+        log::info!("Listening for RTCP traffic on {}", socket_addr);
         socket
     };
 
@@ -358,7 +338,7 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, Can
     let token = CancellationToken::new();
 
     let ring = HeapRb::<u8>::new(24000);
-    let (mut producer, mut consumer) = ring.split();
+    let (producer, mut consumer) = ring.split();
 
     let host = cpal::default_host();
     let device = host.default_output_device().expect("No output audio device found");
@@ -394,11 +374,11 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, Can
                     };
                 }
                 if input_fell_behind {
-                    eprintln!("input stream fell behind: try increasing latency");
+                    log::error!("input stream fell behind: try increasing latency");
                 }
             },
             move |err| {
-                println!("Audio output error: {}", err);
+                log::error!("Audio output error: {}", err);
             },
             Some(Duration::from_millis(30)) // None=blocking, Some(Duration)=timeout
         ).expect("Could not build output stream");
@@ -417,10 +397,146 @@ async fn listen_for_rtp (peer_addr: SocketAddr) -> anyhow::Result<(u16, u16, Can
         // Finally, unblock the audio streaming thread, so the `stream` value
         // can drop and thereby stop outputting audio.
         thread2.thread().unpark();
+        /* Implementation decision: since the resource that is actually a matter
+        of contention on this server is the audio output, exiting the busy state
+        will be tied to the closing of the audio stream. */
+        server.is_busy.store(false, Ordering::Relaxed);
     });
 
     Ok((rtp_port, rtcp_port, token))
 }
+
+fn make_general_response (
+    req: &Request,
+    status_code: StatusCode,
+) -> anyhow::Result<Vec<u8>> {
+    // See: https://datatracker.ietf.org/doc/html/rfc3261#section-8.1.1
+    // A valid SIP request formulated by a UAC MUST, at a minimum, contain
+    // the following header fields: To, From, CSeq, Call-ID, Max-Forwards,
+    // and Via; all of these header fields are mandatory in all SIP
+    // requests.
+    let call_id = req.call_id_header()?;
+    let cseq = req.cseq_header()?;
+    let from = req.from_header()?;
+    let to = req.to_header()?;
+    let via = req.via_header()?;
+    let mut headers = Headers::default();
+    headers.push(Header::CallId(call_id.to_owned()));
+    headers.push(Header::CSeq(cseq.to_owned()));
+    headers.push(Header::From(from.to_owned()));
+    headers.push(Header::To(to.to_owned()));
+    headers.push(Header::ContentLength(ContentLength::new("0")));
+    // This is the correct procedure, as long as you are not forwarding, in which
+    // case, you will need to add another Via header.
+    headers.push(via.clone().into());
+    Ok(Response{
+        status_code,
+        version: rsip::Version::V2,
+        headers,
+        body: vec![],
+        ..Default::default()
+    }.to_string().into_bytes())
+}
+
+/// This function determines whether an IP address should be considered "local"
+/// for the purposes of returning the Contact header.
+fn is_local_ip (ip: IpAddr) -> bool {
+    // TODO: Check if it falls within the configured private CIDR subnets.
+    match ip {
+        IpAddr::V4(v4) => v4.is_private()
+            || v4.is_broadcast()
+            || v4.is_documentation()
+            || v4.is_link_local()
+            || v4.is_loopback()
+            || v4.is_multicast()
+            || v4.is_unspecified(),
+        IpAddr::V6(v6) => is_local_ip(v6.to_canonical())
+            || v6.is_loopback()
+            || v6.is_multicast()
+            || v6.is_unspecified()
+    }
+}
+
+async fn get_contact_uri (
+    server: &ServerState,
+    peer_addr: SocketAddr,
+    transport: Transport,
+) -> rsip::Uri {
+    let is_local_peer = is_local_ip(peer_addr.ip());
+    let config_addr = match transport {
+        Transport::Udp => Some(server.config.sip_udp_address()),
+        Transport::Tcp => Some(server.config.sip_tcp_address()),
+        _ => None,
+    };
+    // If we configured the IP address to "unspecified" (0.0.0.0 or ::),
+    // we just pretend that we configured no IP address.
+    let config_addr = config_addr
+        .and_then(|addr| if addr.ip().is_unspecified() { None } else { Some(addr) });
+    let my_host = if is_local_peer {
+        if let Some(dns_name) = &server.config.private_dns_name {
+            Host::Domain(Domain::new(dns_name))
+        } else {
+            let my_local_ip = config_addr
+                .map(|a| a.ip())
+                .or(local_ip().ok())
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            Host::IpAddr(my_local_ip)
+        }
+    } else {
+        if let Some(dns_name) = &server.config.public_dns_name {
+            Host::Domain(Domain::new(dns_name))
+        } else {
+            // TODO: Cache the answer.
+            let public_ip = public_ip::addr().await;
+            let my_public_ip = config_addr
+                .map(|a| a.ip())
+                .or(public_ip)
+                .or(local_ip().ok())
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                ;
+            Host::IpAddr(my_public_ip)
+        }
+    };
+    let port = match transport {
+        Transport::Udp => Some(server.config.sip_udp_port()),
+        Transport::Tcp => Some(server.config.sip_tcp_port()),
+        _ => None
+    };
+
+    let base_uri = rsip::Uri {
+        scheme: Some(rsip::Scheme::Sip), // TODO: What should the scheme be?
+        auth: server.config.local_name.as_ref().map(|ln| (ln, Option::<String>::None).into()),
+        host_with_port: rsip::HostWithPort::from((my_host, port)),
+        ..Default::default()
+    };
+    base_uri
+}
+
+async fn get_contact (
+    server: &ServerState,
+    peer_addr: SocketAddr,
+    transport: Transport,
+) -> Contact {
+    let contact_uri = get_contact_uri(server, peer_addr, transport).await;
+    Contact{
+        display_name: server.config.local_display_name.as_ref().map(|n| n.into()),
+        uri: contact_uri.clone(),
+        params: vec![],
+    }
+}
+
+// async fn get_connection_ip (
+//     server: &ServerState,
+//     peer_addr: SocketAddr,
+//     transport: Transport,
+// ) -> IpAddr {
+//     let is_local_peer = is_local_ip(peer_addr.ip());
+//     let config_ip = match transport {
+//         Transport::Udp => Some(server.config.sip_udp_interface()),
+//         Transport::Tcp => Some(server.config.sip_tcp_interface()),
+//         _ => None,
+//     };
+// }
 
 async fn handle_ack (
     server: ServerState,
@@ -469,26 +585,33 @@ async fn handle_bye (
     server: ServerState,
     req: Request,
     peer: PeerState,
-) -> anyhow::Result<()> {
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+) -> anyhow::Result<bool> {
     let call_id = req.call_id_header()?;
     let mut calls = peer.calls.write().await;
     let maybe_call = calls.remove(&call_id.to_string());
     if maybe_call.is_none() {
         log::warn!("No such call with identifier {}", call_id.to_string());
-        // TODO: Send error response.
+        let resp = make_general_response(&req, StatusCode::CallTransactionDoesNotExist)?;
+        tx.send((resp, peer.addr)).await?;
+        return Ok(false);
     };
     /* In theory, nothing else should be needed to drop the resources used by
     the call. We use DropGuards in CallState so that the RTP sockets get closed
     when the call is ended. */
-    Ok(())
+    // Delete PeerState if this is the last call.
+    let peers = peer.calls.read().await;
+    let forget_peer = peers.len() == 0;
+    Ok(forget_peer)
 }
 
 async fn handle_cancel (
     server: ServerState,
     req: Request,
     peer: PeerState,
-) -> anyhow::Result<()> {
-    handle_bye(server, req, peer).await
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+) -> anyhow::Result<bool> {
+    handle_bye(server, req, peer, tx).await
 }
 
 async fn handle_info (
@@ -506,6 +629,13 @@ async fn handle_invite (
     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     transport: Transport,
 ) -> anyhow::Result<()> {
+    let is_busy = server.is_busy.swap(true, Ordering::Relaxed);
+    if is_busy {
+        let resp = make_general_response(&req, StatusCode::BusyEverywhere)?;
+        tx.send((resp, peer.addr)).await?;
+        return Ok(());
+    }
+
     let req_body = std::mem::take(&mut req.body);
     let call_id = req.call_id_header()?;
     let cseq = req.cseq_header()?;
@@ -520,35 +650,102 @@ async fn handle_invite (
     });
     match content_type {
         Some(ct) => {
-            let ct = ct.typed().unwrap().0; // TODO: Handle error?
+            let ct = ct.typed()?.0;
             match ct {
                 MediaType::Sdp(sdpct) => {
                     // Do nothing. This is fine.
                 },
                 _ => {
-                    // TODO: Respond with error.
+                    log::warn!("INVITE Request did not have a suitable Content-Type");
+                    let resp = make_general_response(&req, StatusCode::UnsupportedMediaType)?;
+                    tx.send((resp, peer.addr)).await?;
+                    return Ok(());
                 },
             };
         },
         None => {
-            // TODO: Respond with error.
+            log::warn!("INVITE Request did not have a Content-Type header");
+            let resp = make_general_response(&req, StatusCode::BadRequest)?;
+            tx.send((resp, peer.addr)).await?;
+            return Ok(());
         }
     };
+
+    // Validate other headers.
+    for h in req.headers.iter() {
+        match h {
+            Header::ContentDisposition(cd) => {
+                if cd.to_string() != String::from("session") {
+                    log::warn!("Invalid Content-Disposition for SDP descriptor in INVITE");
+                    let resp = make_general_response(&req, StatusCode::BadRequest)?;
+                    tx.send((resp, peer.addr)).await?;
+                    return Ok(());
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /* NOTE: 
+    The initial Request-URI of the message SHOULD be set to the value of
+    the URI in the To field.
+    Source: https://datatracker.ietf.org/doc/html/rfc3261#section-8.1.1.1
+     */
+    if let Ok(uri) = &to.uri() {
+        if let Some(auth) = &uri.auth {
+            if let Some(local_name) = &server.config.local_name {
+                if auth.user != *local_name {
+                    log::warn!("Call not meant for this server. No such user {}", auth.user);
+                    let resp = make_general_response(&req, StatusCode::NotFound)?;
+                    tx.send((resp, peer.addr)).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // Beyond this point, we are assuming the content type is SDP.
-    // TODO: Ensure that Content-Disposition is either missing or session.
     let req_body = match String::from_utf8(req_body) {
         Ok(s) => s,
         Err(_) => {
             // This is a requirement of sdp_rs, not the protocol itself.
             // But it would be insane to have some other weird encoding.
             log::warn!("Invalid INVITE body: not UTF-8 encoded");
-            // TODO: Send error response
+            let resp = make_general_response(&req, StatusCode::BadRequest)?;
+            tx.send((resp, peer.addr)).await?;
             return Ok(());
         },
     };
     let mut sdreq = SessionDescription::from_str(req_body.as_str())?;
-    let mut reqmedia = std::mem::take(&mut sdreq.media_descriptions);
+    if sdreq.version != Version::V0 {
+        // Technically, this is also supposed to return the supported media types.
+        // But this doesn't make sense here, because our problem is not exactly
+        // the Content-Type, but its version.
+        log::warn!("Invalid INVITE body: SDP not version 0");
+        let resp = make_general_response(&req, StatusCode::UnsupportedMediaType)?;
+        tx.send((resp, peer.addr)).await?;
+        return Ok(());
+    }
+    
+    // We currently do not support any session scheduling.
+    let first_time = sdreq.times.first();
+    if sdreq.times.len() != 1
+        || first_time.active.start != 0
+        || first_time.active.stop != 0
+        || first_time.repeat.len() != 0 {
+        log::warn!("SDP session scheduling via the t= parameter not supported");
+        let resp = make_general_response(&req, StatusCode::NotImplemented)?;
+        tx.send((resp, peer.addr)).await?;
+        return Ok(());
+    }
+    if sdreq.media_descriptions.len() == 0 {
+        log::warn!("SDP descriptor invalid: zero media sessions");
+        let resp = make_general_response(&req, StatusCode::BadRequest)?;
+        tx.send((resp, peer.addr)).await?;
+        return Ok(());
+    }
 
+    let mut reqmedia = std::mem::take(&mut sdreq.media_descriptions);
     let mut drop_guards: Vec<DropGuard> = vec![];
     for m in reqmedia.iter_mut() {
         // FIXME: If sendonly (relative to who?), only open RTCP port.
@@ -558,7 +755,7 @@ async fn handle_invite (
         let attrs = std::mem::take(&mut m.attributes);
         let (rtp_port, rtcp_port, cancel) = if supported {
             // This function name is deceptive. It also listens for RTCP.
-            listen_for_rtp(peer.addr).await?
+            listen_for_rtp(server.clone(), peer.addr).await?
         } else {
             (0, 0, CancellationToken::new())
         };
@@ -568,7 +765,6 @@ async fn handle_invite (
             port: rtp_port,
             num_of_ports: None, // TODO: Is this right?
             proto: ProtoType::RtpAvp,
-            // TODO: Actually check that 8 was among the options.
             fmt: "8".to_string(), // Payload Type 8 = G.711 A-Law (PCMA)
         };
         m.media = media;
@@ -586,51 +782,27 @@ async fn handle_invite (
         m.attributes.push(direction);
         m.attributes.push(Attribute::Other("rtcp".into(), Some(rtcp_port.to_string())));
     }
-    // TODO: Ensure its V0
-    // TODO: Reject if NOT t=0 0 (we will implement session scheduling later)
-    // TODO: Reject if there are zero medias
-    // TODO: Select media types and respond.
     let mut new_call = CallState::new(call_id.clone());
     new_call.drop_guards = drop_guards;
     let new_call = Arc::new(Mutex::new(new_call));
     let mut calls = peer.calls.write().await;
+    if calls.len() > MAX_CALLS_PER_PEER {
+        let resp = make_general_response(&req, StatusCode::Forbidden)?;
+        tx.send((resp, peer.addr)).await?;
+        return Ok(());
+    }
     calls.insert(call_id.to_string(), new_call.clone());
     drop(calls);
 
-    // TODO: Check if directed to this server
-    // TODO: Write Trying
+    let trying = make_general_response(&req, StatusCode::Trying)?;
+    tx.send((trying, peer.addr)).await?;
+    let ringing = make_general_response(&req, StatusCode::Ringing)?;
+    tx.send((ringing, peer.addr)).await?;
 
-    // TODO: Via header
-    // Via: SIP/2.0/UDP 192.168.1.2;received=80.230.219.70;rport=5060;branch=z9hG4bKnp112903503-43a64480192.168.1.2
-    // let via = Via::from("");
-    let mut trying_headers = Headers::default();
-    trying_headers.push(Header::CallId(call_id.to_owned()));
-    trying_headers.push(Header::CSeq(cseq.to_owned()));
-    trying_headers.push(Header::From(from.to_owned()));
-    trying_headers.push(Header::To(to.to_owned()));
-    trying_headers.push(Header::ContentLength(ContentLength::new("0")));
-    trying_headers.push(via.clone().into()); // TODO: I don't think this is right.
-    let trying = Response{
-        status_code: StatusCode::Trying,
-        version: Version::V2,
-        headers: trying_headers,
-        body: vec![],
-        ..Default::default()
-    };
-    tx.send((trying.to_string().into_bytes(), peer.addr)).await?;
-    // TODO: Write Ringing
-
-    let my_local_ip = local_ip().unwrap(); // TODO: Handle errors
-    let my_host = Host::IpAddr(my_local_ip);
-    let base_uri = rsip::Uri {
-        scheme: Some(rsip::Scheme::Sip),
-        auth: Some(("bob", Option::<String>::None).into()),
-        host_with_port: rsip::HostWithPort::from((my_host, 50051)), // FIXME: Configurable port
-        ..Default::default()
-    };
-
+    let my_local_ip = local_ip().unwrap(); // FIXME: Remove this once https://github.com/Televiska/sdp-rs/issues/8 is fixed.
     let sdresp = SessionDescription{
         version: sdp_rs::lines::Version::V0,
+        // TODO: Blocked on https://github.com/Televiska/sdp-rs/issues/8
         origin: sdreq.origin.to_owned(), // TODO: This has to be changed to this server, because we modify the SDP answer.
         session_name: sdreq.session_name.to_owned(),
         session_info: sdreq.session_info.to_owned(),
@@ -639,13 +811,13 @@ async fn handle_invite (
         phones: sdreq.phones.to_owned(),
         /* It seems that you MUST return this for clients to work. */
         connection: Some(Connection{
+            nettype: sdp_rs::lines::common::Nettype::In,
             addrtype: sdp_rs::lines::common::Addrtype::Ip4,
             connection_address: ConnectionAddress{
-                base: my_local_ip,
+                base: my_local_ip, // TODO: Bug: this can be a hostname: https://github.com/Televiska/sdp-rs/issues/8
                 numaddr: None,
                 ttl: None,
             },
-            nettype: sdp_rs::lines::common::Nettype::In,
         }),
         bandwidths: vec![],
         times: sdreq.times.to_owned(),
@@ -653,6 +825,7 @@ async fn handle_invite (
         attributes: vec![], // TODO: Maybe copy from the request?
         media_descriptions: reqmedia,
     };
+    let contact = get_contact(&server, peer.addr, transport).await;
     let ok_body = sdresp.to_string().into_bytes();
     let mut ok_headers = Headers::default();
     ok_headers.push(Header::CallId(call_id.to_owned()));
@@ -660,12 +833,10 @@ async fn handle_invite (
     ok_headers.push(Header::From(from.to_owned()));
     ok_headers.push(Header::To(to.to_owned()));
     ok_headers.push(Header::ContentLength(ContentLength::new(ok_body.len().to_string().as_str())));
-    ok_headers.push(Contact{
-        display_name: Some("skwisgar".into()),
-        uri: base_uri.clone(),
-        params: vec![],
-    }.into());
-    ok_headers.push(via.clone().into()); // TODO: I don't think this is right.
+    ok_headers.push(contact.into());
+    // This is the correct procedure, as long as you are not forwarding, in which
+    // case, you will need to add another Via header.
+    ok_headers.push(via.clone().into());
     ok_headers.push(Allow(ALLOWED_METHODS.to_vec()).into());
     ok_headers.push(Supported::from(SUPPORTED_OPTIONS.to_string()).into());
     ok_headers.push(Accept::from(vec![
@@ -679,15 +850,40 @@ async fn handle_invite (
 
     let ok = Response{
         status_code: StatusCode::OK,
-        version: Version::V2,
+        version: rsip::Version::V2,
         headers: ok_headers,
         body: ok_body,
         ..Default::default()
     };
+    let cseq = cseq.typed()?;
     let mut call = new_call.lock().await;
-    call.status = CallStatus::WaitingForAck(cseq.typed().unwrap()); // TODO: Handle this error? What could even happen?
+    call.status = CallStatus::WaitingForAck(cseq);
+    drop(call);
     tx.send((ok.to_string().into_bytes(), peer.addr)).await?;
-    // TODO: Implement re-transmission described in https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
+    /*
+    From https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4:
+    > The 2xx response is passed to the transport with an
+    > interval that starts at T1 seconds and doubles for each
+    > retransmission until it reaches T2 seconds
+
+    Quite honestly, something about this code stinks. Not returning from
+    handle_invite before handle_ack is already processed seems like a bug
+    waiting to happen. But I am going to live with this for now. Sorry.
+     */
+    let mut timer = DEFAULT_T1_MILLISECONDS;
+    while timer < DEFAULT_T2_MILLISECONDS {
+        sleep(Duration::from_millis(timer.into())).await;
+        let mut call = new_call.lock().await;
+        if !call.status.is_waiting() {
+            // If we are not waiting anymore, the call has begun.
+            return Ok(());
+        }
+        drop(call);
+        tx.send((ok.to_string().into_bytes(), peer.addr)).await?;
+        timer *= 2;
+    }
+    // If we made it here, we failed to receive an ACK that began the call.
+    log::warn!("Did not receive ACK in time to begin call {}", call_id.to_string());
     Ok(())
 }
 
@@ -724,28 +920,19 @@ async fn handle_options (
     let from = req.from_header()?;
     let to = req.to_header()?;
     let via = req.via_header()?;
-
-    let my_local_ip = local_ip().unwrap(); // TODO: Handle errors
-    let my_host = Host::IpAddr(my_local_ip);
-    let base_uri = rsip::Uri {
-        scheme: Some(rsip::Scheme::Sip),
-        auth: Some(("bob", Option::<String>::None).into()), // FIXME:
-        host_with_port: rsip::HostWithPort::from((my_host, 50051)), // FIXME: Configurable port
-        ..Default::default()
-    };
-
+    
+    let contact = get_contact(&server, peer_addr, transport).await;
     let mut headers = Headers::default();
     headers.push(Header::CallId(call_id.to_owned()));
     headers.push(Header::CSeq(cseq.to_owned()));
     headers.push(Header::From(from.to_owned()));
     headers.push(Header::To(to.to_owned()));
     headers.push(Header::ContentLength(ContentLength::new("0")));
-    headers.push(via.clone().into()); // TODO: I don't think this is right.
-    headers.push(Contact{
-        display_name: Some("goobis".into()), // TODO: 
-        uri: base_uri.clone(),
-        params: vec![],
-    }.into());
+
+    // This is the correct procedure, as long as you are not forwarding, in which
+    // case, you will need to add another Via header.
+    headers.push(via.clone().into());
+    headers.push(contact.into());
     headers.push(Allow(ALLOWED_METHODS.to_vec()).into());
     headers.push(Supported::from(SUPPORTED_OPTIONS.to_string()).into());
     headers.push(Accept::from(vec![
@@ -756,18 +943,22 @@ async fn handle_options (
     headers.push(Server::new(SERVER).into());
     // TODO: Allow-Events (when subscriptions are supported)
 
-    // TODO: Check busy status
+    let is_busy = server.is_busy.swap(true, Ordering::Relaxed);
+    if is_busy {
+        let resp = make_general_response(&req, StatusCode::BusyEverywhere)?;
+        tx.send((resp, peer_addr)).await?;
+        return Ok(());
+    }
 
     let res = Response{
         status_code: StatusCode::OK,
-        version: Version::V2,
+        version: rsip::Version::V2,
         headers,
         body: vec![],
         ..Default::default()
     };
     tx.send((res.to_string().into_bytes(), peer_addr)).await?;
-
-    unimplemented!()
+    Ok(())
 }
 
 async fn handle_prack (
@@ -818,8 +1009,40 @@ async fn handle_update (
     unimplemented!()
 }
 
-async fn invalid_sequence (peer_addr: SocketAddr) {
-    unimplemented!()
+async fn invalid_sequence (
+    req: &Request,
+    peer_addr: SocketAddr,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+) -> anyhow::Result<()> {
+    log::warn!("Invalid SIP request sequence from peer {}", peer_addr);
+    let resp = make_general_response(&req, StatusCode::BadRequest)?;
+    tx.send((resp, peer_addr)).await?;
+    return Ok(());
+}
+
+async fn unsupported_method (
+    req: &Request,
+    peer_addr: SocketAddr,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+) -> anyhow::Result<()> {
+    log::warn!("Unsupported SIP method {} from peer {}", req.method().to_string(), peer_addr);
+    let resp = make_general_response(&req, StatusCode::MethodNotAllowed)?;
+    tx.send((resp, peer_addr)).await?;
+    return Ok(());
+}
+
+fn reset_inactivity_timeout (server: ServerState, peer: &mut PeerState) {
+    let addr = peer.addr;
+    let h = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(server.config.inactivity_timeout.into())).await;
+        let mut peers = server.peers.write().await;
+        peers.remove(&addr);
+    });
+    peer.impending_doom.as_ref().and_then(|doom| -> Option<AbortHandle> {
+        doom.abort();
+        None
+    });
+    peer.impending_doom = Some(h.abort_handle());
 }
 
 async fn handle_request_and_errors (
@@ -829,14 +1052,18 @@ async fn handle_request_and_errors (
     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     transport: Transport,
 ) -> anyhow::Result<()> {
-    let peer = {
+    let mut peer = {
         let peers_map = server.peers.read().await;
         peers_map.get(&peer_addr).cloned()
     };
+    if let Some(p) = peer.as_mut() {
+        reset_inactivity_timeout(server.clone(), p);
+    }
+
     match req.method {
         Method::Ack => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
             let peer = peer.unwrap();
@@ -844,35 +1071,43 @@ async fn handle_request_and_errors (
         },
         Method::Bye => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
             let peer = peer.unwrap();
-            handle_bye(server, req, peer).await
+            let forget_peer = handle_bye(server.clone(), req, peer, tx).await?;
+            if forget_peer {
+                let mut peers = server.peers.write().await;
+                peers.remove(&peer_addr);
+            }
+            Ok(())
         },
         Method::Cancel => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
             let peer = peer.unwrap();
-            handle_cancel(server, req, peer).await
+            let forget_peer = handle_cancel(server.clone(), req, peer, tx).await?;
+            if forget_peer {
+                let mut peers = server.peers.write().await;
+                peers.remove(&peer_addr);
+            }
+            Ok(())
         },
         Method::Info => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
-            let peer = peer.unwrap();
-            unimplemented!()
+            // let peer = peer.unwrap();
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Invite => {
             let peer: PeerState = if peer.is_none() {
                 log::info!("New peer {}", peer_addr);
-                let new_peer = PeerState{
-                    addr: peer_addr,
-                    calls: Arc::new(RwLock::new(HashMap::new())),
-                };
+                let mut new_peer = PeerState::new(peer_addr);
+                reset_inactivity_timeout(server.clone(), &mut new_peer);
                 let mut peers = server.peers.write().await;
                 peers.insert(peer_addr, new_peer.to_owned());
                 new_peer
@@ -882,52 +1117,52 @@ async fn handle_request_and_errors (
             handle_invite(server, req, peer, tx, transport).await
         },
         Method::Message => {
-            unimplemented!()
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Notify => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
-            let peer = peer.unwrap();
-            unimplemented!()
+            // let peer = peer.unwrap();
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Options => {
             handle_options(server, req, peer_addr, tx, transport).await
         },
         Method::PRack => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
-            let peer = peer.unwrap();
-            unimplemented!()
+            // let peer = peer.unwrap();
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Publish => {
-            unimplemented!()
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Refer => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
-            let peer = peer.unwrap();
-            unimplemented!()
+            // let peer = peer.unwrap();
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Register => {
-            unimplemented!()
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Subscribe => {
-            unimplemented!()
+            unsupported_method(&req, peer_addr, tx).await
         },
         Method::Update => {
             if peer.is_none() {
-                invalid_sequence(peer_addr).await;
+                invalid_sequence(&req, peer_addr, tx).await;
                 return Ok(());
             }
-            let peer = peer.unwrap();
-            unimplemented!()
-        },
+            // let peer = peer.unwrap();
+            unsupported_method(&req, peer_addr, tx).await
+        }
     }
 }
 
@@ -946,18 +1181,48 @@ async fn handle_request (
     };
 }
 
+async fn get_config () -> anyhow::Result<(Config, Option<PathBuf>)> {
+    for possible_path in CONFIG_LOCATIONS.iter() {
+        for possible_suffix in CONFIG_SUFFIXES.iter() {
+            let path_str = [ *possible_path, *possible_suffix ].join("");
+            let path = PathBuf::from_str(path_str.as_str())
+                .expect("failed to construct configuration file path");
+            match read_to_string(&path).await {
+                Ok(s) => return Ok((toml::from_str(&s)?, Some(path))),
+                Err(e) => {
+                    if e.kind() == ErrorKind::NotFound {
+                        continue;
+                    }
+                }
+            };
+        }
+    }
+    Ok((Config::default(), None))
+}
+
 #[cfg(not(target_os = "wasi"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::exit;
 
     let mut udp_buf = [0; 65536];
+
+    let (config, config_path) = get_config().await?;
+    log4rs::init_config(get_default_log4rs_config()).unwrap();
+    if let Some(cp) = config_path {
+        log::info!("Using configuration file at {}", cp.display());
+    } else {
+        log::info!("No configuration file found. Using all defaults.");
+    }
+
+    let udp_local_addr = config.sip_udp_address();
+    let tcp_local_addr = config.sip_tcp_address();
+
     let state = ServerState{
         peers: Arc::new(RwLock::new(HashMap::new())),
+        is_busy: Arc::new(AtomicBool::new(false)),
+        config: Arc::new(config),
     };
-
-    log4rs::init_config(get_default_log4rs_config()).unwrap();
-    let udp_local_addr: SocketAddr = udp_server_addr;
-    let tcp_local_addr: SocketAddr = tcp_server_addr;
 
     let udp_receive_socket = Arc::new(UdpSocket::bind(udp_local_addr).await.expect("Failed to bind with UDP"));
     let udp_send_socket = udp_receive_socket.clone();
@@ -969,8 +1234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1_000);
     tokio::spawn(async move {
         while let Some((bytes, addr)) = rx.recv().await {
-            let len = udp_send_socket.send_to(&bytes, &addr).await.unwrap();
-            println!("{:?} bytes sent", len);
+            udp_send_socket.send_to(&bytes, &addr).await.unwrap(); // TODO: Handle errors
         }
     });
 
@@ -978,7 +1242,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             result = udp_receive_socket.recv_from(&mut udp_buf) => {
                 if result.is_err() {
-                    todo!()
+                    let e = result.err().unwrap();
+                    if e.kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+                    log::error!("Fatal error reading datagrams from UDP socket: {}", e);
+                    log::error!("Shutting down because of the above error.");
+                    exit(2);
                 }
                 let (len, peer_addr) = result.unwrap();
                 let req = match Request::try_from(&udp_buf[0..len]) {

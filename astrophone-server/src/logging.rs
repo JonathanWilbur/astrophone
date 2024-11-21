@@ -6,7 +6,7 @@ pub fn get_default_log4rs_config () -> Config {
     let stdout = ConsoleAppender::builder().build();
     Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
-        .logger(Logger::builder().build("yeetbox", LevelFilter::Info))
+        .logger(Logger::builder().build("astrophone", LevelFilter::Info))
         .build(Root::builder().appender("stdout").build(LevelFilter::Info))
         .unwrap()
 }

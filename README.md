@@ -47,18 +47,22 @@ which I will perfect the client.
   - [x] `ACK`
     - [ ] What to do with the ports before this is received?
     - [ ] Clean up session if `ACK` not received in time.
+      - [ ] The timeout needs to vary: if the call is established, it should not
+            time out.
   - [x] `BYE`
   - [x] `CANCEL`
   - [x] `OPTIONS`
-  - [ ] Clean up dangling dialogs
-  - [ ] Proper logging
-  - [ ] Configuration or Discovery of Own IP address
-  - [ ] Handling of unknown messages
+  - [x] Clean up dangling dialogs
+  - [x] Proper logging
+  - [x] Configuration or Discovery of Own IP address
+  - [x] Handling of unknown messages
   - [ ] RTCP
   - [ ] G.711 u-Law (PCMU)
-  - [ ] Handle Busy Line
+  - [x] Handle Busy Line
   - [ ] Handle Duplicate Call-ID among invites
-  - [ ] Configurable Username
+  - [x] Configurable Username
+  - [ ] TCP
+  - [x] Limit the number of calls
 - [ ] Client Library
 - [ ] CLI / Shell
   - [ ] `call` Subcommand
@@ -179,3 +183,4 @@ few more fields and flexibility, so there is a lot more parsing burden.
 - [ ] Encryption per https://www.rfc-editor.org/info/rfc9335
 - [ ] Call Records
 - [ ] Web Interface
+- [ ] Scheduling calls for later using SDP's `t=` parameter
