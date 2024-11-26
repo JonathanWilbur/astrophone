@@ -121,9 +121,11 @@ async fn receive_rtp_packets (
     rtcp_socket: UdpSocket,
     cancel: CancellationToken,
     mut producer: CachingProd<Arc<SharedRb<Heap<u8>>>>,
+    play_flag: Arc<AtomicBool>,
 ) {
     let mut rtcp_buf = [0; 65536];
     let mut rtp_buf = [0; 65536];
+    let mut playing = false;
 
     loop {
         tokio::select! {
@@ -138,6 +140,11 @@ async fn receive_rtp_packets (
                 }
                 match rtp_rs::RtpReader::new(&rtp_buf[0..len]) {
                     Ok(rtp_packet) => {
+                        if !playing {
+                            play_flag.store(true, Ordering::Relaxed);
+                            playing = true;
+                        }
+                        // TODO: Trigger playback
                         // TODO: Check the stream number and such from the packet.
                         // handle_rtp_packet(&rtp_packet);
                         producer.push_slice(rtp_packet.payload());
@@ -161,8 +168,8 @@ async fn receive_rtp_packets (
                     log::warn!("Invalid RTCP packet from {}", peer_addr);
                     continue;
                 }
-                if rtcp_buf[0] & 0b1100_0000 != 0b1000_0000 {
-                    log::warn!("Unsupported RTCP packet version from peer {}", peer_addr);
+                if (rtcp_buf[0] & 0b1100_0000) != 0b1000_0000 {
+                    log::warn!("Unsupported RTCP packet version from peer {} (first byte was {:#04X})", peer_addr, rtcp_buf[0]);
                     continue;
                 }
                 // TODO: Check version
@@ -347,18 +354,21 @@ async fn listen_for_rtp (
     let config = supported_configs
         .find(|c| c.channels() == 1 && c.sample_format() == SampleFormat::I16);
     let config = config.unwrap().with_sample_rate(SampleRate(8000)).into();
+    let play_flag = Arc::new(AtomicBool::new(false));
     tokio::spawn(receive_rtp_packets(
         peer_addr,
         rtp_socket,
         rtcp_socket,
         token.clone(),
         producer,
+        play_flag.clone(),
     ));
 
     /* If this approach seems abstruse, let me assure you I did not want to do
     it this way. See: https://github.com/RustAudio/cpal/issues/818 */
     let flag = Arc::new(AtomicBool::new(false));
     let flag2 = Arc::clone(&flag);
+    let play_flag2 = play_flag.clone();
     let thread2 = std::thread::spawn(move || {
         let stream = device.build_output_stream(
             &config,
@@ -380,8 +390,11 @@ async fn listen_for_rtp (
             move |err| {
                 log::error!("Audio output error: {}", err);
             },
+            // None,
             Some(Duration::from_millis(30)) // None=blocking, Some(Duration)=timeout
         ).expect("Could not build output stream");
+        // TODO: Use play_flag?
+        std::thread::sleep(Duration::from_millis(1000));
         stream.play().expect("Could not start audio output");
         while !flag2.load(Ordering::Relaxed) {
             std::thread::park();
@@ -503,8 +516,9 @@ async fn get_contact_uri (
         _ => None
     };
 
+    // TODO: When TLS is supported, prefer the SIPS URI, if configured.
     let base_uri = rsip::Uri {
-        scheme: Some(rsip::Scheme::Sip), // TODO: What should the scheme be?
+        scheme: Some(rsip::Scheme::Sip),
         auth: server.config.local_name.as_ref().map(|ln| (ln, Option::<String>::None).into()),
         host_with_port: rsip::HostWithPort::from((my_host, port)),
         ..Default::default()
@@ -642,6 +656,7 @@ async fn handle_invite (
     let from = req.from_header()?;
     let to = req.to_header()?;
     let via = req.via_header()?;
+    let mut is_linphone = false;
     let content_type = req.headers.iter().find_map(|h| {
         match h {
             Header::ContentType(ct) => Some(ct),
@@ -682,6 +697,11 @@ async fn handle_invite (
                     return Ok(());
                 }
             },
+            Header::UserAgent(ua) => {
+                if ua.value().starts_with("LinphoneAndroid") {
+                    is_linphone = true;
+                }
+            }
             _ => {}
         }
     }
@@ -796,8 +816,18 @@ async fn handle_invite (
 
     let trying = make_general_response(&req, StatusCode::Trying)?;
     tx.send((trying, peer.addr)).await?;
-    let ringing = make_general_response(&req, StatusCode::Ringing)?;
-    tx.send((ringing, peer.addr)).await?;
+
+    /* For some reason, it seems like Linphone simply doesn't work if you return
+    a ringing response. I have tested returning this without a Trying, with
+    delays, etc. Nothing works and I see nothing wrong with the Ringing response.
+    No obvious error appears in the Linphone debug logs.
+    
+    Reported: https://github.com/BelledonneCommunications/linphone-android/issues/2286
+    */
+    if !is_linphone {
+        let ringing = make_general_response(&req, StatusCode::Ringing)?;
+        tx.send((ringing, peer.addr)).await?;
+    }
 
     let my_local_ip = local_ip().unwrap(); // FIXME: Remove this once https://github.com/Televiska/sdp-rs/issues/8 is fixed.
     let sdresp = SessionDescription{
@@ -1063,16 +1093,14 @@ async fn handle_request_and_errors (
     match req.method {
         Method::Ack => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             let peer = peer.unwrap();
             handle_ack(server, req, peer, tx, transport).await
         },
         Method::Bye => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             let peer = peer.unwrap();
             let forget_peer = handle_bye(server.clone(), req, peer, tx).await?;
@@ -1084,8 +1112,7 @@ async fn handle_request_and_errors (
         },
         Method::Cancel => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             let peer = peer.unwrap();
             let forget_peer = handle_cancel(server.clone(), req, peer, tx).await?;
@@ -1097,8 +1124,7 @@ async fn handle_request_and_errors (
         },
         Method::Info => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             // let peer = peer.unwrap();
             unsupported_method(&req, peer_addr, tx).await
@@ -1121,8 +1147,7 @@ async fn handle_request_and_errors (
         },
         Method::Notify => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             // let peer = peer.unwrap();
             unsupported_method(&req, peer_addr, tx).await
@@ -1132,8 +1157,7 @@ async fn handle_request_and_errors (
         },
         Method::PRack => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             // let peer = peer.unwrap();
             unsupported_method(&req, peer_addr, tx).await
@@ -1143,8 +1167,7 @@ async fn handle_request_and_errors (
         },
         Method::Refer => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             // let peer = peer.unwrap();
             unsupported_method(&req, peer_addr, tx).await
@@ -1157,8 +1180,7 @@ async fn handle_request_and_errors (
         },
         Method::Update => {
             if peer.is_none() {
-                invalid_sequence(&req, peer_addr, tx).await;
-                return Ok(());
+                return invalid_sequence(&req, peer_addr, tx).await;
             }
             // let peer = peer.unwrap();
             unsupported_method(&req, peer_addr, tx).await
@@ -1251,6 +1273,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     exit(2);
                 }
                 let (len, peer_addr) = result.unwrap();
+
+                // For toleration of Linphone's keepalives over UDP, which is
+                // INVALID. See: https://lists.gnu.org/archive/html/linphone-developers/2017-06/msg00045.html
+                if len == 4 && udp_buf.starts_with([ b'\r', b'\n', b'\r', b'\n' ].as_slice()) {
+                    continue;
+                }
                 let req = match Request::try_from(&udp_buf[0..len]) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1266,7 +1294,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let (tcp_socket, _) = result.unwrap();
                 // process_socket(tcp_socket).await;
-                unimplemented!()
+                // unimplemented!()
+                // TODO:
             }
         }
     };
