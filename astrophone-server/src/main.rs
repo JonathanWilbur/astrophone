@@ -157,7 +157,7 @@ async fn receive_rtp_packets (
             val = rtcp_socket.recv_from(&mut rtcp_buf) => {
                 let (len, peer_addr) = val.unwrap(); // TODO: Handle
                 if peer_addr.ip() != correct_peer_addr.ip() {
-                    println!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
+                    log::warn!("unauthorized RTP packet from {}, but owner is {}", peer_addr, correct_peer_addr);
                     continue; // Just ignore packets from naughtybois.
                 }
                 if len < 8 {
@@ -394,7 +394,7 @@ async fn listen_for_rtp (
             Some(Duration::from_millis(30)) // None=blocking, Some(Duration)=timeout
         ).expect("Could not build output stream");
         // TODO: Use play_flag?
-        std::thread::sleep(Duration::from_millis(1000));
+        // std::thread::sleep(Duration::from_millis(5000));
         stream.play().expect("Could not start audio output");
         while !flag2.load(Ordering::Relaxed) {
             std::thread::park();
@@ -899,11 +899,13 @@ async fn handle_invite (
     Quite honestly, something about this code stinks. Not returning from
     handle_invite before handle_ack is already processed seems like a bug
     waiting to happen. But I am going to live with this for now. Sorry.
+
+    89cb0590-6389-4501-a8af-119636bb8916
      */
     let mut timer = DEFAULT_T1_MILLISECONDS;
     while timer < DEFAULT_T2_MILLISECONDS {
         sleep(Duration::from_millis(timer.into())).await;
-        let mut call = new_call.lock().await;
+        let call = new_call.lock().await;
         if !call.status.is_waiting() {
             // If we are not waiting anymore, the call has begun.
             return Ok(());
@@ -1136,6 +1138,7 @@ async fn handle_request_and_errors (
                 reset_inactivity_timeout(server.clone(), &mut new_peer);
                 let mut peers = server.peers.write().await;
                 peers.insert(peer_addr, new_peer.to_owned());
+                drop(peers);
                 new_peer
             } else {
                 peer.unwrap()
@@ -1286,7 +1289,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     },
                 };
-                handle_request(state.to_owned(), req, peer_addr, tx.clone(), Transport::Udp).await;
+                // If you do not spawn this task, each request will have to
+                // complete in order. Search 89cb0590-6389-4501-a8af-119636bb8916
+                // for a code location where this was a problem.
+                tokio::spawn(handle_request(state.to_owned(), req, peer_addr, tx.clone(), Transport::Udp));
             }
             result = tcp_listener.accept() => {
                 if result.is_err() {
