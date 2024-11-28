@@ -7,9 +7,10 @@ use rsip::headers::{AcceptEncoding, AcceptLanguage, ContentLength, Server, Suppo
 use rsip::prelude::{HasHeaders, HeadersExt, ToTypedHeader, UntypedHeader};
 use rsip::typed::content_disposition::DisplayType;
 use rtcp::{RTCPHeader, SenderReportHeader};
+use sdp_rs::lines::common::{Addrtype, Nettype};
 use sdp_rs::lines::connection::ConnectionAddress;
 use sdp_rs::lines::media::ProtoType;
-use sdp_rs::lines::{Attribute, Connection, Media, Origin, Version};
+use sdp_rs::lines::{key, Attribute, Connection, Media, Origin, Version};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
@@ -100,6 +101,18 @@ const CONFIG_SUFFIXES: [ &str; 2 ] = [
     ".config.toml",
 ];
 
+fn make_empty_sender_report (ssrc: u32) -> Vec<u8> {
+    [
+        0b1000_0000,
+        RTCP_PT_RR,
+        0, 0, // length in 32-bit words - 1
+        ((ssrc & 0xFF00_0000) >> 24) as u8,
+        ((ssrc & 0x00FF_0000) >> 16) as u8,
+        ((ssrc & 0x0000_FF00) >> 8) as u8,
+        ((ssrc & 0x0000_00FF) >> 0) as u8,
+    ].into()
+}
+
 fn handle_rtp_packet <'a> (
     rtp_packet: &'a rtp_rs::RtpReader<'a>,
 ) {
@@ -122,16 +135,29 @@ async fn receive_rtp_packets (
     cancel: CancellationToken,
     mut producer: CachingProd<Arc<SharedRb<Heap<u8>>>>,
     play_flag: Arc<AtomicBool>,
+    remote_rtcp_addr: Option<SocketAddr>,
 ) {
     let mut rtcp_buf = [0; 65536];
     let mut rtp_buf = [0; 65536];
     let mut playing = false;
+    let mut ssrc: Option<u32> = None; // We don't know the SSRC yet.
+    let rtcp_socket = Arc::new(rtcp_socket);
+    let rtcp_socket2 = rtcp_socket.clone();
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
             }
+            // _ = sleep(Duration::from_secs(5)) => {
+            //     if ssrc.is_none() {
+            //         continue;
+            //     }
+            //     sleep(Duration::from_secs(3)).await;
+            //     println!("RTCP SR SSRC was {}", ssrc);
+            //     let sr = make_empty_sender_report(ssrc);
+            //     tx.send((sr, correct_peer_addr)).await;
+            // }
             val = socket.recv_from(&mut rtp_buf) => {
                 let (len, peer_addr) = val.unwrap(); // TODO: Handle
                 if peer_addr.ip() != correct_peer_addr.ip() {
@@ -143,6 +169,19 @@ async fn receive_rtp_packets (
                         if !playing {
                             play_flag.store(true, Ordering::Relaxed);
                             playing = true;
+                        }
+                        if ssrc.is_none() && remote_rtcp_addr.is_some() {
+                            let remote_rtcp_addr = remote_rtcp_addr.unwrap();
+                            ssrc = Some(rtp_packet.ssrc());
+                            let rtcp_socket2 = rtcp_socket2.clone();
+                            // FIXME: You are sending this packet to the wrong port dummy!
+                            tokio::spawn(async move {
+                                loop {
+                                    sleep(Duration::from_secs(3)).await;
+                                    let sr = make_empty_sender_report(ssrc.unwrap());
+                                    rtcp_socket2.send_to(sr.as_slice(), remote_rtcp_addr).await;
+                                }
+                            });
                         }
                         // TODO: Trigger playback
                         // TODO: Check the stream number and such from the packet.
@@ -312,6 +351,7 @@ async fn receive_rtp_packets (
 async fn listen_for_rtp (
     server: ServerState,
     peer_addr: SocketAddr,
+    peer_rtcp_addr: Option<SocketAddr>,
 ) -> anyhow::Result<(u16, u16, CancellationToken)> {
     let port = 0; // This means "give me any port."
     let ip = Ipv4Addr::new(0, 0, 0, 0); // TODO: Make this configurable.
@@ -344,7 +384,7 @@ async fn listen_for_rtp (
     
     let token = CancellationToken::new();
 
-    let ring = HeapRb::<u8>::new(24000);
+    let ring = HeapRb::<u8>::new(48000);
     let (producer, mut consumer) = ring.split();
 
     let host = cpal::default_host();
@@ -362,6 +402,7 @@ async fn listen_for_rtp (
         token.clone(),
         producer,
         play_flag.clone(),
+        peer_rtcp_addr,
     ));
 
     /* If this approach seems abstruse, let me assure you I did not want to do
@@ -390,11 +431,10 @@ async fn listen_for_rtp (
             move |err| {
                 log::error!("Audio output error: {}", err);
             },
-            // None,
-            Some(Duration::from_millis(30)) // None=blocking, Some(Duration)=timeout
+            None,
         ).expect("Could not build output stream");
         // TODO: Use play_flag?
-        // std::thread::sleep(Duration::from_millis(5000));
+        // std::thread::sleep(Duration::from_millis(10000));
         stream.play().expect("Could not start audio output");
         while !flag2.load(Ordering::Relaxed) {
             std::thread::park();
@@ -581,6 +621,12 @@ async fn handle_ack (
                 // TODO: Send error response
             }
             call.status = CallStatus::InProgress;
+            // We don't want the call to timeout due to activity when we are
+            // actually on the call, receiving RTP packets!
+            peer.impending_doom.as_ref().and_then(|doom| -> Option<AbortHandle> {
+                doom.abort();
+                None
+            });
             // TODO: Set up RTP stream.
             // listen_for_rtp(peer.addr).await?;
         },
@@ -698,7 +744,9 @@ async fn handle_invite (
                 }
             },
             Header::UserAgent(ua) => {
-                if ua.value().starts_with("LinphoneAndroid") {
+                // TODO: What about Linphone iOS?
+                // This is "LinphoneAndroid" on Android; not sure about iOS.
+                if ua.value().starts_with("Linphone") {
                     is_linphone = true;
                 }
             }
@@ -767,15 +815,47 @@ async fn handle_invite (
 
     let mut reqmedia = std::mem::take(&mut sdreq.media_descriptions);
     let mut drop_guards: Vec<DropGuard> = vec![];
+    // TODO: Only support one audio stream?
     for m in reqmedia.iter_mut() {
         // FIXME: If sendonly (relative to who?), only open RTCP port.
         let supported: bool = m.media.media == sdp_rs::lines::media::MediaType::Audio
             && m.media.proto == ProtoType::RtpAvp
             && m.media.fmt.split(" ").any(|f| f == "8");
         let attrs = std::mem::take(&mut m.attributes);
+        let mut remote_rtcp_port: Option<u16> = None;
+        // TODO: Validate no contradicting attributes
+        let mut direction: Attribute = Attribute::Sendrecv;
+        for attr in attrs.iter() {
+            match attr {
+                Attribute::Recvonly
+                | Attribute::Sendonly
+                | Attribute::Sendrecv
+                | Attribute::Inactive => direction = attr.to_owned(),
+                | Attribute::Other(key, value) => {
+                    match key.as_str() {
+                        "rtcp" => {
+                            if let Some(v) = value {
+                                remote_rtcp_port = Some(v.parse()?);
+                            }
+                        },
+                        _ => {},
+                    };
+                },
+                _ => {},
+            }
+        }
+        //You MUST still send RTCP packets, even if this is the case.
+        // https://datatracker.ietf.org/doc/html/rfc8866#section-6.7.1
+        direction = Attribute::Recvonly;
+
         let (rtp_port, rtcp_port, cancel) = if supported {
+            let remote_rtcp_addr = remote_rtcp_port.map(|p| {
+                let mut peer_addr = peer.addr.clone();
+                peer_addr.set_port(p);
+                peer_addr
+            });
             // This function name is deceptive. It also listens for RTCP.
-            listen_for_rtp(server.clone(), peer.addr).await?
+            listen_for_rtp(server.clone(), peer.addr, remote_rtcp_addr).await?
         } else {
             (0, 0, CancellationToken::new())
         };
@@ -788,17 +868,6 @@ async fn handle_invite (
             fmt: "8".to_string(), // Payload Type 8 = G.711 A-Law (PCMA)
         };
         m.media = media;
-        // TODO: Validate no contradicting attributes
-        let mut direction: Attribute = Attribute::Sendrecv;
-        for attr in attrs.iter() {
-            match attr {
-                Attribute::Recvonly
-                | Attribute::Sendonly
-                | Attribute::Sendrecv
-                | Attribute::Inactive => direction = attr.to_owned(),
-                _ => {},
-            }
-        }
         m.attributes.push(direction);
         m.attributes.push(Attribute::Other("rtcp".into(), Some(rtcp_port.to_string())));
     }
@@ -830,10 +899,16 @@ async fn handle_invite (
     }
 
     let my_local_ip = local_ip().unwrap(); // FIXME: Remove this once https://github.com/Televiska/sdp-rs/issues/8 is fixed.
+    let mut origin = sdreq.origin.to_owned();
+    // TODO: Incorrect. See: https://github.com/Televiska/sdp-rs/issues/8
+    origin.addrtype = if my_local_ip.is_ipv4() { Addrtype::Ip4 } else { Addrtype::Ip6 };
+    origin.nettype = Nettype::In;
+    origin.unicast_address = my_local_ip;
+    origin.username = server.config.local_name.clone().unwrap_or(String::from(""));
+
     let sdresp = SessionDescription{
         version: sdp_rs::lines::Version::V0,
-        // TODO: Blocked on https://github.com/Televiska/sdp-rs/issues/8
-        origin: sdreq.origin.to_owned(), // TODO: This has to be changed to this server, because we modify the SDP answer.
+        origin, // This has to be changed to this server, because we modify the SDP answer.
         session_name: sdreq.session_name.to_owned(),
         session_info: sdreq.session_info.to_owned(),
         uri: sdreq.uri.to_owned(),
@@ -916,6 +991,7 @@ async fn handle_invite (
     }
     // If we made it here, we failed to receive an ACK that began the call.
     log::warn!("Did not receive ACK in time to begin call {}", call_id.to_string());
+    // TODO: I think you need to delete the call here.
     Ok(())
 }
 
